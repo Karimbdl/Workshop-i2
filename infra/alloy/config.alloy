@@ -1,0 +1,154 @@
+// Collecte des journaux de tous les conteneurs du projet et envoi vers Loki.
+// Alloy passe par un proxy Docker en lecture seule : il ne peut ni démarrer, ni arrêter, ni modifier un conteneur.
+// Il calcule aussi des compteurs à partir des journaux (passerelle, WAF, connexions), exposés à Prometheus.
+
+discovery.docker "projet" {
+  host             = "tcp://docker-proxy-ro:2375"
+  refresh_interval = "10s"
+
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=resilience-alpha"]
+  }
+}
+
+discovery.relabel "projet" {
+  targets = []
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "projet" {
+  host             = "tcp://docker-proxy-ro:2375"
+  targets          = discovery.docker.projet.targets
+  relabel_rules    = discovery.relabel.projet.rules
+  refresh_interval = "10s"
+  forward_to       = [loki.process.journaux.receiver]
+}
+
+loki.process "journaux" {
+
+  // --- Journaux d'audit du pare-feu applicatif (ModSecurity, JSON sur une ligne).
+  stage.match {
+    selector = "{service=\"gateway\"} |= \"\\\"transaction\\\"\""
+
+    stage.json {
+      expressions = {
+        client_ip = "transaction.client_ip",
+        http_code = "transaction.response.http_code",
+        uri       = "transaction.request.uri",
+      }
+    }
+
+    // Les sondes de santé internes ne sont pas des événements de sécurité.
+    stage.drop {
+      source = "client_ip"
+      value  = "127.0.0.1"
+    }
+
+    stage.static_labels {
+      values = { log_type = "waf_audit" }
+    }
+
+    stage.template {
+      source   = "waf_blocked"
+      template = "{{ if eq .http_code \"403\" }}1{{ end }}"
+    }
+
+    stage.metrics {
+      metric.counter {
+        name        = "waf_events_total"
+        prefix      = "devolut_"
+        description = "Événements journalisés par le pare-feu applicatif"
+        match_all   = true
+        action      = "inc"
+      }
+
+      metric.counter {
+        name        = "waf_blocked_total"
+        prefix      = "devolut_"
+        description = "Requêtes bloquées par le pare-feu applicatif (403)"
+        source      = "waf_blocked"
+        value       = "1"
+        action      = "inc"
+      }
+    }
+
+    stage.structured_metadata {
+      values = { client_ip = "" }
+    }
+  }
+
+  // --- Journal d'accès de la passerelle (une ligne JSON par requête).
+  stage.match {
+    selector = "{service=\"gateway\"} |= \"\\\"msg\\\":\\\"http_access\\\"\""
+
+    stage.json {
+      expressions = {
+        status    = "status",
+        method    = "method",
+        client_ip = "client_ip",
+      }
+    }
+
+    stage.static_labels {
+      values = { log_type = "access" }
+    }
+
+    stage.labels {
+      values = { status = "", method = "" }
+    }
+
+    stage.metrics {
+      metric.counter {
+        name        = "gateway_requests_total"
+        prefix      = "devolut_"
+        description = "Requêtes reçues par la passerelle, par statut et méthode"
+        match_all   = true
+        action      = "inc"
+      }
+    }
+
+    stage.structured_metadata {
+      values = { client_ip = "" }
+    }
+  }
+
+  // --- Journaux JSON des services Python : niveau et événement.
+  stage.match {
+    selector = "{service=~\"auth-service|payment-api|ledger-service\"}"
+
+    stage.json {
+      expressions = {
+        level     = "level",
+        event     = "msg",
+        client_ip = "client_ip",
+      }
+    }
+
+    stage.labels {
+      values = { level = "" }
+    }
+
+    stage.structured_metadata {
+      values = { event = "", client_ip = "" }
+    }
+  }
+
+  forward_to = [loki.write.loki.receiver]
+}
+
+loki.write "loki" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

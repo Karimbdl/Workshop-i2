@@ -1,0 +1,60 @@
+flowchart LR
+  subgraph LAN["Réseau du consortium : point d'accès RESILIENCE-Gn (192.168.137.0/24)"]
+    direction TB
+    USR["Navigateur client / jury"]
+    ATK["PC Attaquant<br/>VM Kali (mode pont)"]
+    IA["PC IA (optionnel)<br/>Ollama, modèle ≤ 8 Md"]
+  end
+
+  subgraph HOST["PC Hôte : 192.168.137.1, Docker Desktop (WSL2)"]
+    direction LR
+    subgraph EDGE["Zone exposée"]
+      GW["Passerelle<br/>Nginx + ModSecurity CRS<br/>port 8080"]
+    end
+    subgraph APP["Zone applicative (réseau interne)"]
+      direction TB
+      FE["Site client<br/>React + Tailwind"]
+      AUTH["auth-service<br/>JWT RS256, MFA"]
+      PAY["payment-api<br/>idempotence, rejeu"]
+      LED["ledger-service<br/>partie double"]
+    end
+    subgraph DATA["Zone données (réseau interne)"]
+      direction TB
+      PG[("PostgreSQL<br/>1 rôle et 1 schéma par service")]
+      RD[("Redis")]
+    end
+    subgraph OBS["Zone supervision"]
+      direction TB
+      PROM["Prometheus"]
+      LOKI["Loki + Alloy"]
+      GRAF["Grafana, vue SOC"]
+      DET["Détecteur ML"]
+    end
+    subgraph ADM["Zone administration (prévu)"]
+      direction TB
+      OPS["Console de supervision"]
+      REM["Moteur de remédiation"]
+      PROXY["Proxy Docker restreint"]
+      ANS["Ansible"]
+      VAULT["Vault"]
+      RAG["Assistant RAG"]
+    end
+  end
+
+  USR -->|HTTP 8080| GW
+  ATK -.->|attaque| GW
+  GW --> FE & AUTH & PAY & LED
+  PAY -->|virement| LED
+  AUTH & PAY & LED --> PG
+  AUTH --> RD
+  APP -.->|métriques, journaux| OBS
+  PROM & LOKI --> DET
+  DET -->|incident| REM
+  OPS --> REM
+  REM --> PROXY & ANS
+  REM -.->|blocage IP, paiement sonde| GW
+  VAULT -.->|secrets| APP
+  RAG -.-> IA
+
+  classDef planned stroke-dasharray: 4 3
+  class DET,OPS,REM,PROXY,ANS,VAULT,RAG planned

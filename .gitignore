@@ -1,0 +1,17 @@
+# Secrets : jamais dans le dépôt
+secrets/
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+
+# Données et artefacts générés
+runtime/
+*.log

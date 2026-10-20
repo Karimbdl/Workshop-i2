@@ -1,0 +1,1 @@
+# Dépendances communes uniquement (voir services/common/requirements.txt)

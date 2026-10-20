@@ -1,0 +1,388 @@
+name: resilience-alpha
+
+# Règles communes de durcissement des conteneurs applicatifs.
+x-hardening: &hardening
+  restart: unless-stopped
+  read_only: true
+  tmpfs: ["/tmp"]
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+x-python-service: &python-service
+  <<: *hardening
+  environment: &python-env
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    DB_HOST: postgres
+    DB_NAME: resilience
+    JWKS_URL: http://auth-service:8000/.well-known/jwks.json
+  depends_on:
+    postgres: { condition: service_healthy }
+
+services:
+  # ---------------------------------------------------------------- Bordure
+  gateway:
+    image: owasp/modsecurity-crs:nginx-alpine
+    restart: unless-stopped
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "${GATEWAY_BIND:-0.0.0.0}:${GATEWAY_PORT:-8080}:8080"
+    environment:
+      PORT: "8080"
+      API_RATE_LIMIT: ${API_RATE_LIMIT:-50r/s}
+      API_RATE_BURST: ${API_RATE_BURST:-100}
+      LOGIN_RATE_LIMIT: ${LOGIN_RATE_LIMIT:-5r/s}
+      LOGIN_RATE_BURST: ${LOGIN_RATE_BURST:-10}
+      MAX_CONN_PER_IP: ${MAX_CONN_PER_IP:-100}
+      PARANOIA: "1"
+      BLOCKING_PARANOIA: "1"
+      ANOMALY_INBOUND: "5"
+      MODSEC_RULE_ENGINE: "on"
+      MODSEC_RESP_BODY_ACCESS: "off"
+      MODSEC_AUDIT_LOG: /dev/stdout
+      MODSEC_AUDIT_LOG_FORMAT: JSON
+      ACCESSLOG: /dev/null
+      METRICSLOG: /dev/null
+    volumes:
+      - ./infra/gateway/default.conf.template:/etc/nginx/templates/conf.d/default.conf.template:ro
+      - ./infra/gateway/blocklist:/etc/nginx/blocklist:ro
+    networks: [edge, app]
+    depends_on: [frontend]
+    healthcheck:
+      # En-tête Host explicite : une adresse IP brute déclenche une règle du WAF et polluerait les journaux.
+      test: ["CMD-SHELL", "wget -q --header 'Host: localhost' -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 256M, pids: 200 }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  frontend:
+    <<: *hardening
+    build: ./services/frontend
+    image: resilience-alpha/frontend:dev
+    tmpfs: ["/tmp", "/var/cache/nginx"]
+    networks: [app]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 64M, pids: 200 }
+
+  # ------------------------------------------------------------ Applicatif
+  auth-service:
+    <<: *python-service
+    build:
+      context: ./services
+      dockerfile: python.Dockerfile
+      args: { SERVICE_DIR: auth-service }
+    image: resilience-alpha/auth-service:dev
+    environment:
+      <<: *python-env
+      REDIS_HOST: redis
+      ACCESS_TOKEN_MINUTES: "15"
+    secrets: [db_auth_password, redis_password, jwt_private_key, seed_users]
+    networks: [app, data]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 256M, pids: 200 }
+
+  ledger-service:
+    <<: *python-service
+    build:
+      context: ./services
+      dockerfile: python.Dockerfile
+      args: { SERVICE_DIR: ledger-service }
+    image: resilience-alpha/ledger-service:dev
+    secrets: [db_ledger_password, internal_token]
+    networks: [app, data]
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 256M, pids: 200 }
+
+  payment-api:
+    <<: *python-service
+    build:
+      context: ./services
+      dockerfile: python.Dockerfile
+      args: { SERVICE_DIR: payment-api }
+    image: resilience-alpha/payment-api:dev
+    environment:
+      <<: *python-env
+      LEDGER_URL: http://ledger-service:8000
+      PAYMENT_MAX_AMOUNT: "5000.00"
+    secrets: [db_payment_password, internal_token]
+    networks: [app, data]
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 256M, pids: 200 }
+
+  # --------------------------------------------------------------- Données
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      POSTGRES_DB: resilience
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password, db_auth_password, db_ledger_password, db_payment_password, db_monitor_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d resilience"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "1.5", memory: 512M, pids: 200 }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    user: "999:999"
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$(cat /run/secrets/redis_password)\" --save '' --appendonly no --maxmemory 64mb --maxmemory-policy volatile-lru"]
+    secrets: [redis_password]
+    tmpfs: ["/data"]
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$(cat /run/secrets/redis_password)\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 128M, pids: 200 }
+
+  # ------------------------------------------------------------- Détection
+  ml-detector:
+    <<: *hardening
+    build:
+      context: ./services
+      dockerfile: python.Dockerfile
+      args: { SERVICE_DIR: ml-detector }
+    image: resilience-alpha/ml-detector:dev
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PROMETHEUS_URL: http://prometheus:9090
+      POLL_INTERVAL_SECONDS: ${ML_POLL_INTERVAL:-15}
+      MIN_BASELINE_SAMPLES: ${ML_MIN_BASELINE:-40}
+    secrets: [internal_token]
+    volumes:
+      - ml-model:/app/model
+    networks: [obs]
+    depends_on:
+      prometheus: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "0.75", memory: 384M, pids: 200 }
+
+  # ----------------------------------------------------------- Supervision
+  prometheus:
+    <<: *hardening
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.retention.size=1GB
+      - --web.enable-lifecycle
+    volumes:
+      - ./infra/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    networks: [obs, app]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 384M, pids: 200 }
+
+  loki:
+    <<: *hardening
+    image: grafana/loki:3.5.1
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./infra/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+    networks: [obs]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3100/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 384M, pids: 200 }
+
+  # Proxy Docker en lecture seule : liste les conteneurs et lit leurs journaux, rien d'autre.
+  docker-proxy-ro:
+    image: tecnativa/docker-socket-proxy:v0.4.1
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/run", "/tmp", "/var/lib/haproxy"]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      CONTAINERS: "1"
+      NETWORKS: "1"
+      EVENTS: "1"
+      PING: "1"
+      VERSION: "1"
+      POST: "0"
+      LOG_LEVEL: warning
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [dockerapi-ro]
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 64M, pids: 100 }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  alloy:
+    <<: *hardening
+    image: grafana/alloy:v1.9.2
+    user: "473:473"
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - --disable-reporting
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./infra/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy/data
+    networks: [obs, dockerapi-ro]
+    depends_on: [loki, docker-proxy-ro]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M, pids: 200 }
+
+  nginx-exporter:
+    <<: *hardening
+    image: nginx/nginx-prometheus-exporter:1.4.2
+    command: ["--nginx.scrape-uri=http://gateway:8080/stub_status"]
+    networks: [obs, app]
+    depends_on: [gateway]
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 32M, pids: 50 }
+
+  postgres-exporter:
+    <<: *hardening
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    environment:
+      DATA_SOURCE_URI: postgres:5432/resilience?sslmode=disable
+      DATA_SOURCE_USER: monitor_svc
+      DATA_SOURCE_PASS_FILE: /run/secrets/db_monitor_password
+    secrets: [db_monitor_password]
+    networks: [obs, data]
+    depends_on:
+      postgres: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 64M, pids: 50 }
+
+  redis-exporter:
+    <<: *hardening
+    image: oliver006/redis_exporter:v1.74.0
+    command: ["--redis.addr=redis://redis:6379", "--redis.password-file=/run/secrets/redis_exporter_auth"]
+    secrets: [redis_exporter_auth]
+    networks: [obs, data]
+    depends_on:
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 32M, pids: 50 }
+
+  grafana:
+    <<: *hardening
+    image: grafana/grafana:12.0.2
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/devolut-overview.json
+      GF_LOG_LEVEL: warn
+    secrets: [grafana_admin_password]
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks: [obs, mgmt]
+    depends_on: [prometheus, loki]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 256M, pids: 200 }
+
+networks:
+  edge: {}
+  app:
+    internal: true
+  data:
+    internal: true
+  # Supervision : sans sortie Internet.
+  obs:
+    internal: true
+  # Accès Docker en lecture seule, réservé à Alloy.
+  dockerapi-ro:
+    internal: true
+  # Publication de Grafana sur 127.0.0.1 uniquement (un réseau interne ne peut pas publier de port).
+  mgmt: {}
+
+volumes:
+  pgdata: {}
+  prometheus-data: {}
+  loki-data: {}
+  alloy-data: {}
+  grafana-data: {}
+  ml-model: {}
+
+secrets:
+  postgres_password: { file: ./secrets/postgres_password }
+  db_auth_password: { file: ./secrets/db_auth_password }
+  db_ledger_password: { file: ./secrets/db_ledger_password }
+  db_payment_password: { file: ./secrets/db_payment_password }
+  redis_password: { file: ./secrets/redis_password }
+  internal_token: { file: ./secrets/internal_token }
+  jwt_private_key: { file: ./secrets/jwt_private_key }
+  seed_users: { file: ./secrets/seed_users }
+  db_monitor_password: { file: ./secrets/db_monitor_password }
+  redis_exporter_auth: { file: ./secrets/redis_exporter_auth }
+  grafana_admin_password: { file: ./secrets/grafana_admin_password }

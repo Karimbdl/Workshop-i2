@@ -1,0 +1,116 @@
+# Passerelle RESILIENCE-ALPHA : seul point d'entrée exposé au réseau du consortium.
+# Nginx + ModSecurity (OWASP CRS). Ce modèle remplace celui fourni par l'image.
+
+server_tokens off;
+more_set_headers 'Server: resilience-gateway';
+
+# Journal d'accès JSON, exploité par Loki (SOC) et par le modèle de détection.
+log_format gateway_json escape=json '{"ts":"$time_iso8601","service":"gateway","msg":"http_access",'
+    '"client_ip":"$remote_addr","method":"$request_method","path":"$uri","status":$status,'
+    '"bytes":$body_bytes_sent,"request_time_s":$request_time,"upstream_status":"$upstream_status",'
+    '"upstream_time":"$upstream_response_time","user_agent":"$http_user_agent","request_id":"$request_id"}';
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+# Liste de blocage alimentée par le moteur de remédiation (rechargée à chaud).
+geo $remote_addr $is_banned {
+    default 0;
+    include /etc/nginx/blocklist/banned.conf;
+}
+
+limit_req_zone $binary_remote_addr zone=api_per_ip:10m rate=${API_RATE_LIMIT};
+limit_req_zone $binary_remote_addr zone=login_per_ip:10m rate=${LOGIN_RATE_LIMIT};
+limit_req_status 429;
+limit_conn_zone $binary_remote_addr zone=conn_per_ip:10m;
+limit_conn_status 429;
+
+# Résolution DNS dynamique : la passerelle démarre et reste en vie même si un service est arrêté.
+map $host $auth_upstream     { default "auth-service:8000"; }
+map $host $payment_upstream  { default "payment-api:8000"; }
+map $host $ledger_upstream   { default "ledger-service:8000"; }
+map $host $frontend_upstream { default "frontend:8080"; }
+
+server {
+    listen ${PORT} default_server;
+    server_name _;
+
+    access_log /dev/stdout gateway_json;
+    client_max_body_size 64k;
+    limit_conn conn_per_ip ${MAX_CONN_PER_IP};
+
+    if ($is_banned) {
+        return 403;
+    }
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Connection "";
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Request-Id $request_id;
+    # Les en-têtes internes ne doivent jamais venir de l'extérieur.
+    proxy_set_header X-Internal-Token "";
+    proxy_connect_timeout 2s;
+    proxy_read_timeout 10s;
+    proxy_send_timeout 10s;
+
+    location = /api/auth/login {
+        limit_req zone=login_per_ip burst=${LOGIN_RATE_BURST} nodelay;
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_pass http://$auth_upstream;
+    }
+
+    location /api/auth/ {
+        limit_req zone=api_per_ip burst=${API_RATE_BURST} nodelay;
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_pass http://$auth_upstream;
+    }
+
+    location /api/payments {
+        limit_req zone=api_per_ip burst=${API_RATE_BURST} nodelay;
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_pass http://$payment_upstream;
+    }
+
+    location /api/accounts {
+        limit_req zone=api_per_ip burst=${API_RATE_BURST} nodelay;
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_pass http://$ledger_upstream;
+    }
+
+    # Tout le reste de /api (dont /internal, /metrics, /docs) est refusé.
+    location /api/ {
+        return 404;
+    }
+
+    location / {
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "DENY" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" always;
+        proxy_pass http://$frontend_upstream;
+    }
+
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "OK";
+    }
+
+    # Métriques nginx : uniquement depuis le réseau interne (exporter Prometheus).
+    location = /stub_status {
+        access_log off;
+        allow 172.16.0.0/12;
+        deny all;
+        stub_status;
+    }
+}

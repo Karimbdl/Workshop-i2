@@ -1,0 +1,82 @@
+# Règles de base : elles servent de filet de sécurité au détecteur ML et alimentent la vue SOC.
+groups:
+  - name: indicateurs
+    rules:
+      # Requêtes par seconde vues par la passerelle, par code de statut.
+      - record: devolut:gateway_requests:rate1m
+        expr: sum by (status) (rate(devolut_gateway_requests_total[1m]))
+      - record: devolut:gateway_error_ratio:rate1m
+        expr: |
+          sum(rate(devolut_gateway_requests_total{status=~"5.."}[1m]))
+          / clamp_min(sum(rate(devolut_gateway_requests_total[1m])), 0.001)
+      - record: devolut:payments:rate5m
+        expr: sum by (status) (rate(payments_total[5m]))
+      - record: devolut:login_failures:rate1m
+        expr: sum(rate(auth_login_attempts_total{result!="success"}[1m]))
+
+  - name: disponibilite
+    rules:
+      - alert: ServiceIndisponible
+        expr: up{job=~"services|gateway|postgres|redis"} == 0
+        for: 30s
+        labels: { severity: critical, category: availability }
+        annotations:
+          summary: "{{ $labels.service }} ne répond plus"
+          description: "La cible {{ $labels.instance }} est injoignable depuis 30 s."
+
+      - alert: BaseDeDonneesIndisponible
+        expr: pg_up == 0
+        for: 30s
+        labels: { severity: critical, category: availability }
+        annotations:
+          summary: "PostgreSQL injoignable"
+
+      - alert: TauxErreursEleve
+        expr: devolut:gateway_error_ratio:rate1m > 0.05
+        for: 1m
+        labels: { severity: warning, category: availability }
+        annotations:
+          summary: "Plus de 5 % d'erreurs 5xx sur la passerelle"
+
+      - alert: PaiementsEnAttente
+        expr: payments_pending > 0
+        for: 2m
+        labels: { severity: warning, category: availability }
+        annotations:
+          summary: "{{ $value }} paiement(s) en attente du grand livre depuis plus de 2 min"
+
+      - alert: LatenceGrandLivre
+        expr: histogram_quantile(0.95, sum by (le) (rate(payment_ledger_call_seconds_bucket[2m]))) > 1
+        for: 1m
+        labels: { severity: warning, category: availability }
+        annotations:
+          summary: "Appels au grand livre lents (p95 > 1 s)"
+
+  - name: integrite
+    rules:
+      - alert: GrandLivreIncoherent
+        expr: ledger_integrity_ok == 0
+        labels: { severity: critical, category: integrity }
+        annotations:
+          summary: "Le contrôle d'intégrité du grand livre a détecté {{ with query \"ledger_integrity_anomalies\" }}{{ . | first | value }}{{ end }} anomalie(s)"
+
+  - name: securite
+    rules:
+      - alert: AttaqueApplicativeBloquee
+        expr: sum(rate(devolut_waf_blocked_total[1m])) * 60 > 10
+        labels: { severity: warning, category: security }
+        annotations:
+          summary: "Plus de 10 requêtes bloquées par le pare-feu applicatif en 1 min"
+
+      - alert: LimitationDeDebit
+        expr: sum(rate(devolut_gateway_requests_total{status="429"}[1m])) > 5
+        for: 30s
+        labels: { severity: warning, category: security }
+        annotations:
+          summary: "Pic de requêtes rejetées par la limitation de débit (429)"
+
+      - alert: ForceBruteConnexion
+        expr: devolut:login_failures:rate1m * 60 > 20
+        labels: { severity: warning, category: security }
+        annotations:
+          summary: "Plus de 20 échecs de connexion par minute"
