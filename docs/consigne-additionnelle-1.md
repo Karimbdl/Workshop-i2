@@ -108,7 +108,7 @@ flowchart LR
 | Composant | Rôle | Techno proposée | Où | État |
 |---|---|---|---|---|
 | back-office | Page de connexion (2 phases), machine à états, gestion des habilitations, enrôlement des visages, pilotage de la LED | React + Tailwind (front) / FastAPI (API) | Docker, derrière la passerelle | 🔜 |
-| face-agent | Accède à la caméra USB, calcule l'empreinte du visage, compare à la base enrôlée, renvoie reconnu/non reconnu | Python natif sur le PC Hôte | Processus natif (pas conteneur) | 🔜 |
+| face-agent | Accède à la caméra USB, calcule l'empreinte du visage, compare à la base enrôlée, renvoie reconnu/non reconnu | Python natif + `face_recognition` (dlib), CPU | Processus natif (pas conteneur) | 🔜 |
 | Broker MQTT | Canal découplé entre le back-office et l'ESP8266 | Eclipse Mosquitto | Docker, publié sur le réseau du point d'accès | 🔜 |
 | Firmware ESP8266 | Se connecte au Wi-Fi, s'abonne au canal LED, pilote la LED bicolore selon l'état reçu | C++ (framework Arduino), CLion + PlatformIO | Objet connecté | 🔜 |
 
@@ -172,7 +172,7 @@ avant de passer à la suivante.
 
 | Lot | Contenu | Test de fin | Dépend de |
 |---|---|---|---|
-| **0. Décisions** | Choisir la bibliothèque de reconnaissance (p. ex. `face_recognition`/dlib, ou InsightFace), le câblage de la LED bicolore, confirmer MQTT | Décisions écrites dans ce document | — |
+| **0. Décisions** | Bibliothèque de reconnaissance **décidée** (voir §7.1) ; reste le câblage de la LED bicolore et la confirmation de MQTT | Décisions écrites dans ce document | — |
 | **1. Firmware ESP8266** | Wi-Fi + client MQTT + pilotage LED (les 5 états). CLion + PlatformIO | La LED suit chaque état envoyé à la main via `mosquitto_pub` | Lot 0 |
 | **2. Broker MQTT** | Conteneur Mosquitto, identifiants, intégration au réseau du point d'accès | L'ESP8266 se connecte et reçoit les messages | Lot 1 |
 | **3. face-agent** | Capture caméra, enrôlement, reconnaissance, API locale `verify` | Reconnaît un visage enrôlé, rejette un inconnu, en ligne de commande | Lot 0 |
@@ -184,9 +184,21 @@ sont indépendants et peuvent avancer en parallèle si besoin ; ils se rejoignen
 
 ## 7. Décisions à trancher (lot 0)
 
-1. **Bibliothèque de reconnaissance** : `face_recognition` (dlib) est simple et « léger » au sens
-   CPU ; InsightFace est plus précis mais plus lourd. À choisir selon la mémoire disponible sur le
-   PC Hôte.
+1. **Bibliothèque de reconnaissance — DÉCIDÉE : `face_recognition` (dlib), en CPU.** Option de
+   repli : InsightFace (ArcFace) sur le GPU, si la précision se révèle insuffisante.
+
+   *Contexte matériel du PC Hôte* : 16 Go de RAM, Ryzen 7 7735HS (8 c / 16 t), NVIDIA RTX 4060
+   Laptop (CUDA). Docker est plafonné à 8 Go mais la plateforme n'en utilise qu'environ 700 Mo ;
+   le `face-agent` tourne en natif et dispose donc de marge (au besoin, baisser le plafond Docker
+   à 5-6 Go dans Docker Desktop).
+
+   *Pourquoi dlib* : léger (quelques centaines de Mo), galerie minuscule (2-3 comptes privilégiés :
+   `ops`, `admin`), conditions stables (assis au bureau), empreinte 128 valeurs idéale pour stocker
+   un vecteur par personne au lieu de la photo. Le GPU et InsightFace seraient surdimensionnés pour
+   si peu de visages.
+
+   *Seul piège* : dlib se compile sous Windows (CMake + build tools) ; on l'installe via un **wheel
+   précompilé** pour la version de Python du PC Hôte, sans compilation. À détailler au lot 3.
 2. **Câblage de la LED bicolore** : deux broches GPIO (une par couleur) ou une LED à 3 pattes
    (anode/cathode commune). Décide les résistances et le schéma de câblage.
 3. **Seuil de reconnaissance** : distance maximale acceptée entre l'empreinte vue et l'empreinte
