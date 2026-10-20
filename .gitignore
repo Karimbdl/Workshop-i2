@@ -15,3 +15,6 @@ dist/
 # Données et artefacts générés
 runtime/
 *.log
+
+# Photos des consignes (référence locale, hors dépôt)
+IMG_*.png
