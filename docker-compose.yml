@@ -219,7 +219,11 @@ services:
       PROMETHEUS_URL: http://prometheus:9090
       ML_DETECTOR_URL: http://ml-detector:8000
       REMEDIATION_URL: http://remediation-engine:8000
+      # Secrets servis par Vault (Vault Agent), avec repli sur les Docker secrets.
+      SECRETS_DIRS: /vault/secrets:/run/secrets
     secrets: [internal_token]
+    volumes:
+      - vault-secrets:/vault/secrets:ro
     networks: [app, obs]
     depends_on:
       prometheus: { condition: service_healthy }
@@ -242,10 +246,13 @@ services:
       LEDGER_URL: http://ledger-service:8000
       DOCKER_PROXY_URL: http://docker-proxy-rw:2375
       BLOCKLIST_PATH: /etc/nginx/blocklist/banned.conf
+      # Secrets servis par Vault (Vault Agent), avec repli sur les Docker secrets.
+      SECRETS_DIRS: /vault/secrets:/run/secrets
     secrets: [internal_token, seed_users]
-    # Accès en écriture à la liste de blocage de la passerelle (rechargée à chaud).
     volumes:
+      # Accès en écriture à la liste de blocage de la passerelle (rechargée à chaud).
       - ./infra/gateway/blocklist:/etc/nginx/blocklist:rw
+      - vault-secrets:/vault/secrets:ro
     networks: [app, obs, dockerapi-rw]
     deploy:
       resources:
@@ -453,6 +460,66 @@ services:
       resources:
         limits: { cpus: "1.0", memory: 256M, pids: 200 }
 
+  # --------------------------------------------------------------- Secrets
+  # Coffre-fort Vault : source de vérité des secrets. Vault Agent les récupère
+  # et les écrit dans des fichiers que les services consomment (code inchangé).
+  vault:
+    image: hashicorp/vault:1.18
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      VAULT_ADDR: http://127.0.0.1:8200
+    entrypoint: ["vault", "server", "-config=/vault/config/config.hcl"]
+    volumes:
+      - ./infra/vault/config.hcl:/vault/config/config.hcl:ro
+      - vault-data:/vault/data
+    networks: [vault]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M, pids: 200 }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Amorçage (une fois) : init + descellement + chargement des secrets + AppRole.
+  vault-bootstrap:
+    image: hashicorp/vault:1.18
+    restart: on-failure
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      VAULT_ADDR: http://vault:8200
+    entrypoint: ["sh", "/bootstrap.sh"]
+    volumes:
+      - ./infra/vault/bootstrap.sh:/bootstrap.sh:ro
+      - ./secrets:/seeds:ro
+      - vault-init:/vault/init
+      - vault-agent-auth:/vault/agent-auth
+    networks: [vault]
+    depends_on: [vault]
+
+  # Vault Agent : s'authentifie (AppRole) et rend les secrets dans /vault/secrets.
+  vault-agent:
+    image: hashicorp/vault:1.18
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      VAULT_ADDR: http://vault:8200
+    entrypoint: ["vault", "agent", "-config=/vault/config/agent.hcl"]
+    volumes:
+      - ./infra/vault/agent.hcl:/vault/config/agent.hcl:ro
+      - vault-agent-auth:/vault/agent-auth
+      - vault-secrets:/vault/secrets
+    networks: [vault]
+    depends_on:
+      vault-bootstrap:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128M, pids: 100 }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
 networks:
   edge: {}
   app:
@@ -468,6 +535,9 @@ networks:
   # Accès Docker restreint (redémarrage de conteneurs), réservé au moteur de remédiation.
   dockerapi-rw:
     internal: true
+  # Réseau du coffre-fort Vault (serveur + agent + amorçage).
+  vault:
+    internal: true
   # Publication de Grafana sur 127.0.0.1 uniquement (un réseau interne ne peut pas publier de port).
   mgmt: {}
   # Objets connectés : broker MQTT accessible depuis le LAN (ESP) et l'hôte.
@@ -480,6 +550,10 @@ volumes:
   alloy-data: {}
   grafana-data: {}
   ml-model: {}
+  vault-data: {}          # stockage persistant de Vault
+  vault-init: {}          # clé de descellement + jeton racine (ne pas exposer)
+  vault-agent-auth: {}    # role_id / secret_id / jeton pour Vault Agent
+  vault-secrets: {}       # secrets rendus par Vault Agent, lus par les services
 
 secrets:
   postgres_password: { file: ./secrets/postgres_password }
