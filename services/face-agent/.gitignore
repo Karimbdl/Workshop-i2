@@ -1,0 +1,4 @@
+# Modèles téléchargés (volumineux, régénérables)
+models/
+# Empreintes faciales = données biométriques, jamais dans le dépôt
+faces.json

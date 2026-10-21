@@ -194,6 +194,44 @@ services:
       resources:
         limits: { cpus: "0.75", memory: 384M, pids: 200 }
 
+  # Agrégateur de supervision pour la console d'administration.
+  admin-api:
+    <<: *hardening
+    build:
+      context: ./services
+      dockerfile: python.Dockerfile
+      args: { SERVICE_DIR: admin-api }
+    image: resilience-alpha/admin-api:dev
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      JWKS_URL: http://auth-service:8000/.well-known/jwks.json
+      PROMETHEUS_URL: http://prometheus:9090
+      ML_DETECTOR_URL: http://ml-detector:8000
+    networks: [app, obs]
+    depends_on:
+      prometheus: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 192M, pids: 200 }
+
+  # Broker MQTT : pilotage de la LED du back-office (ESP8266).
+  mqtt:
+    image: eclipse-mosquitto:2.0
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "${MQTT_BIND:-0.0.0.0}:1883:1883"
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    # Réseau dédié non-interne : le broker publie son port pour l'ESP (LAN) et le face-agent (hôte).
+    networks: [iot]
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 64M, pids: 100 }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
   # ----------------------------------------------------------- Supervision
   prometheus:
     <<: *hardening
@@ -365,6 +403,8 @@ networks:
     internal: true
   # Publication de Grafana sur 127.0.0.1 uniquement (un réseau interne ne peut pas publier de port).
   mgmt: {}
+  # Objets connectés : broker MQTT accessible depuis le LAN (ESP) et l'hôte.
+  iot: {}
 
 volumes:
   pgdata: {}

@@ -1,0 +1,2 @@
+# admin-api n'a pas de dépendance propre : tout vient de common/requirements.txt
+# (fastapi, httpx, pyjwt pour la vérification des jetons).

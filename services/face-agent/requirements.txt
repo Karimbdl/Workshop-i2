@@ -1,0 +1,9 @@
+# Reconnaissance faciale sur le PC Hôte (hors Docker : accès direct à la webcam USB).
+opencv-python==4.10.0.84
+numpy==2.1.3
+# Windows : détecte la webcam USB par son nom (choix auto de la caméra).
+pygrabber==0.2 ; platform_system == "Windows"
+# Service HTTP + publication MQTT des états de LED.
+fastapi==0.115.6
+uvicorn==0.34.0
+paho-mqtt==2.1.0

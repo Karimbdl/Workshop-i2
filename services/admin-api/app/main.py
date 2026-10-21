@@ -1,0 +1,175 @@
+"""admin-api : agrège les données de supervision pour la console d'administration.
+
+Lit les incidents repérés par le détecteur ML et l'état des services dans Prometheus,
+et les expose derrière la passerelle, réservés aux rôles operator et admin.
+
+Le moteur de remédiation n'existe pas encore : /admin/remediations renvoie une liste vide
+pour l'instant, et se remplira quand le moteur sera branché.
+"""
+
+import logging
+import os
+from datetime import datetime, timezone
+
+import httpx
+from fastapi import Depends, FastAPI
+
+from resilience_common.http import setup_http
+from resilience_common.logs import log_event, setup_logging
+from resilience_common.security import Principal, require_roles
+
+SERVICE = "admin-api"
+PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
+ML_DETECTOR_URL = os.getenv("ML_DETECTOR_URL", "http://ml-detector:8000")
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SECONDS", "3"))
+
+setup_logging(SERVICE)
+logger = logging.getLogger(SERVICE)
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+# Accès réservé au personnel de supervision.
+staff_only = require_roles("operator", "admin")
+
+# Noms lisibles des cibles Prometheus (clé = valeur du label job).
+SERVICE_LABELS = {
+    "gateway": "Passerelle / WAF",
+    "auth-service": "Authentification",
+    "ledger-service": "Grand livre",
+    "payment-api": "Paiements",
+    "ml-detector": "Détecteur ML",
+    "postgres": "Base de données",
+    "redis": "Cache / verrous",
+    "prometheus": "Prometheus",
+    "loki": "Loki",
+    "alloy": "Collecte de journaux",
+}
+
+# Gravité associée à chaque type d'incident du détecteur.
+GRAVITE = {
+    "integrite": "élevée",
+    "intrusion_applicative": "élevée",
+    "force_brute": "élevée",
+    "disponibilite": "moyenne",
+    "surcharge": "moyenne",
+    "degradation": "faible",
+}
+
+app = FastAPI(title="RESILIENCE-ALPHA admin-api")
+setup_http(app)
+
+
+def _iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def prom_query(expr: str):
+    """Exécute une requête instantanée Prometheus et renvoie la liste des résultats."""
+    url = f"{PROMETHEUS_URL}/api/v1/query"
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        resp = client.get(url, params={"query": expr})
+        resp.raise_for_status()
+        payload = resp.json()
+    if payload.get("status") != "success":
+        raise RuntimeError(f"Prometheus a refusé la requête : {expr}")
+    return payload["data"]["result"]
+
+
+def detector_status() -> dict:
+    """Récupère l'état courant du détecteur ML (incident, score, phase)."""
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        resp = client.get(f"{ML_DETECTOR_URL}/status")
+        resp.raise_for_status()
+        return resp.json()
+
+
+def incident_view(incident: dict | None) -> dict | None:
+    """Met en forme l'incident du détecteur pour la console."""
+    if not incident:
+        return None
+    started = incident.get("started_at", "")
+    return {
+        "id": "INC-" + started.replace(":", "").replace("-", "")[-8:] if started else "INC-?",
+        "type": incident.get("type"),
+        "label": incident.get("label"),
+        "causes": incident.get("causes", []),
+        "gravite": GRAVITE.get(incident.get("type"), "moyenne"),
+        "started_at": started,
+        "peak_score": incident.get("peak_score"),
+    }
+
+
+def services_state() -> list[dict]:
+    """État en ligne / hors ligne de chaque cible, depuis la métrique `up` de Prometheus."""
+    results = prom_query("up")
+    services = []
+    for row in results:
+        # Les services applicatifs partagent le job « services » mais portent un label
+        # `service` propre (auth-service, payment-api, ledger-service) : on le préfère.
+        name = row["metric"].get("service") or row["metric"].get("job", "?")
+        up = row["value"][1] == "1"
+        services.append({"name": name, "label": SERVICE_LABELS.get(name, name), "up": up})
+    services.sort(key=lambda s: (s["up"], s["label"]))
+    return services
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    return {"ready": True}
+
+
+@app.get("/admin/overview")
+def overview(principal: Principal = Depends(staff_only)):
+    """Indicateurs clés de la console."""
+    status = detector_status()
+    incident = status.get("incident")
+    services = services_state()
+    up = sum(1 for s in services if s["up"])
+
+    waf_total = None
+    try:
+        res = prom_query("sum(devolut_waf_events_total)")
+        if res:
+            waf_total = int(float(res[0]["value"][1]))
+    except Exception as exc:  # métrique absente ou Prometheus indisponible : non bloquant
+        log_event(logger, "waf_metric_unavailable", logging.WARNING, error=str(exc))
+
+    return {
+        "detector_state": status.get("state"),
+        "anomaly_score": status.get("anomaly_score"),
+        "incident_active": incident is not None,
+        "services_up": up,
+        "services_total": len(services),
+        "waf_blocked_total": waf_total,
+        "checked_at": _iso(),
+    }
+
+
+@app.get("/admin/incidents")
+def incidents(principal: Principal = Depends(staff_only)):
+    """Incident en cours (0 ou 1 pour l'instant : le détecteur suit un incident à la fois)."""
+    status = detector_status()
+    view = incident_view(status.get("incident"))
+    return {
+        "detector_state": status.get("state"),
+        "anomaly_score": status.get("anomaly_score"),
+        "incidents": [view] if view else [],
+        "checked_at": _iso(),
+    }
+
+
+@app.get("/admin/services")
+def services(principal: Principal = Depends(staff_only)):
+    """État de chaque service de la plateforme."""
+    return {"services": services_state(), "checked_at": _iso()}
+
+
+@app.get("/admin/remediations")
+def remediations(principal: Principal = Depends(staff_only)):
+    """Historique des remédiations. Vide tant que le moteur de remédiation n'est pas branché."""
+    return {"remediations": [], "engine_connected": False, "checked_at": _iso()}

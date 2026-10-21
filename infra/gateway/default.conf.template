@@ -31,6 +31,7 @@ limit_conn_status 429;
 map $host $auth_upstream     { default "auth-service:8000"; }
 map $host $payment_upstream  { default "payment-api:8000"; }
 map $host $ledger_upstream   { default "ledger-service:8000"; }
+map $host $admin_upstream    { default "admin-api:8000"; }
 map $host $frontend_upstream { default "frontend:8080"; }
 
 server {
@@ -85,6 +86,14 @@ server {
         limit_req zone=api_per_ip burst=${API_RATE_BURST} nodelay;
         rewrite ^/api/(.*)$ /$1 break;
         proxy_pass http://$ledger_upstream;
+    }
+
+    # Console d'administration : supervision, réservée aux rôles operator/admin
+    # (l'autorisation est vérifiée par admin-api à partir du jeton).
+    location /api/admin/ {
+        limit_req zone=api_per_ip burst=${API_RATE_BURST} nodelay;
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_pass http://$admin_upstream;
     }
 
     # Tout le reste de /api (dont /internal, /metrics, /docs) est refusé.
