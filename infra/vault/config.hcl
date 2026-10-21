@@ -12,4 +12,4 @@ listener "tcp" {
 // Pas de verrouillage mémoire : évite d'exiger la capacité IPC_LOCK dans le conteneur.
 disable_mlock = true
 api_addr      = "http://vault:8200"
-ui            = false
+ui            = true

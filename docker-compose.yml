@@ -467,13 +467,16 @@ services:
     image: hashicorp/vault:1.18
     restart: unless-stopped
     security_opt: ["no-new-privileges:true"]
+    # Interface web publiée sur 127.0.0.1 uniquement (comme Grafana), jamais sur le LAN.
+    ports:
+      - "127.0.0.1:${VAULT_PORT:-8200}:8200"
     environment:
       VAULT_ADDR: http://127.0.0.1:8200
     entrypoint: ["vault", "server", "-config=/vault/config/config.hcl"]
     volumes:
       - ./infra/vault/config.hcl:/vault/config/config.hcl:ro
       - vault-data:/vault/data
-    networks: [vault]
+    networks: [vault, mgmt]
     deploy:
       resources:
         limits: { cpus: "0.5", memory: 256M, pids: 200 }
