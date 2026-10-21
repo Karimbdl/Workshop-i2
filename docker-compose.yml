@@ -207,9 +207,31 @@ services:
       JWKS_URL: http://auth-service:8000/.well-known/jwks.json
       PROMETHEUS_URL: http://prometheus:9090
       ML_DETECTOR_URL: http://ml-detector:8000
+      REMEDIATION_URL: http://remediation-engine:8000
+    secrets: [internal_token]
     networks: [app, obs]
     depends_on:
       prometheus: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 192M, pids: 200 }
+
+  # Moteur de remédiation : incident -> réparation -> paiement témoin.
+  remediation-engine:
+    <<: *hardening
+    build:
+      context: ./services
+      dockerfile: python.Dockerfile
+      args: { SERVICE_DIR: remediation-engine }
+    image: resilience-alpha/remediation-engine:dev
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ML_DETECTOR_URL: http://ml-detector:8000
+      GATEWAY_URL: http://gateway:8080
+      LEDGER_URL: http://ledger-service:8000
+      DOCKER_PROXY_URL: http://docker-proxy-rw:2375
+    secrets: [internal_token, seed_users]
+    networks: [app, obs, dockerapi-rw]
     deploy:
       resources:
         limits: { cpus: "0.5", memory: 192M, pids: 200 }
@@ -291,6 +313,33 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks: [dockerapi-ro]
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 64M, pids: 100 }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Proxy Docker restreint pour la remédiation : lister + redémarrer des conteneurs,
+  # rien d'autre (pas d'exec, pas d'images, pas de création).
+  docker-proxy-rw:
+    image: tecnativa/docker-socket-proxy:v0.4.1
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/run", "/tmp", "/var/lib/haproxy"]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      CONTAINERS: "1"
+      POST: "1"
+      EXEC: "0"
+      IMAGES: "0"
+      NETWORKS: "0"
+      VOLUMES: "0"
+      INFO: "0"
+      LOG_LEVEL: warning
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [dockerapi-rw]
     deploy:
       resources:
         limits: { cpus: "0.25", memory: 64M, pids: 100 }
@@ -400,6 +449,9 @@ networks:
     internal: true
   # Accès Docker en lecture seule, réservé à Alloy.
   dockerapi-ro:
+    internal: true
+  # Accès Docker restreint (redémarrage de conteneurs), réservé au moteur de remédiation.
+  dockerapi-rw:
     internal: true
   # Publication de Grafana sur 127.0.0.1 uniquement (un réseau interne ne peut pas publier de port).
   mgmt: {}

@@ -16,12 +16,19 @@ from fastapi import Depends, FastAPI
 
 from resilience_common.http import setup_http
 from resilience_common.logs import log_event, setup_logging
+from resilience_common.secrets import read_secret
 from resilience_common.security import Principal, require_roles
 
 SERVICE = "admin-api"
 PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
 ML_DETECTOR_URL = os.getenv("ML_DETECTOR_URL", "http://ml-detector:8000")
+REMEDIATION_URL = os.getenv("REMEDIATION_URL", "http://remediation-engine:8000")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SECONDS", "3"))
+
+try:
+    INTERNAL_TOKEN = read_secret("internal_token")
+except Exception:
+    INTERNAL_TOKEN = None
 
 setup_logging(SERVICE)
 logger = logging.getLogger(SERVICE)
@@ -171,5 +178,14 @@ def services(principal: Principal = Depends(staff_only)):
 
 @app.get("/admin/remediations")
 def remediations(principal: Principal = Depends(staff_only)):
-    """Historique des remédiations. Vide tant que le moteur de remédiation n'est pas branché."""
-    return {"remediations": [], "engine_connected": False, "checked_at": _iso()}
+    """Historique des remédiations, lu depuis le moteur de remédiation."""
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            resp = client.get(f"{REMEDIATION_URL}/internal/remediations",
+                              headers={"X-Internal-Token": INTERNAL_TOKEN or ""})
+            resp.raise_for_status()
+            data = resp.json()
+        return {"remediations": data.get("remediations", []), "engine_connected": True, "checked_at": _iso()}
+    except Exception as exc:
+        log_event(logger, "remediation_unavailable", logging.WARNING, error=str(exc))
+        return {"remediations": [], "engine_connected": False, "checked_at": _iso()}

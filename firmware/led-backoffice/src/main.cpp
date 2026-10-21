@@ -18,11 +18,11 @@
 #include <PubSubClient.h>
 
 // ============================ À CONFIGURER ============================
-// Wi-Fi du point d'accès du groupe.
+// Wi-Fi du point d'accès du groupe (à remplir le jour J).
 static const char* WIFI_SSID     = "RESILIENCE-G1";
 static const char* WIFI_PASSWORD = "A_REMPLIR";
 
-// Broker MQTT = le PC Hôte. Adapter l'IP (et le port si besoin).
+// Broker MQTT = le PC Hôte, sur le point d'accès RESILIENCE-G1.
 static const char* MQTT_HOST = "192.168.137.1";
 static const uint16_t MQTT_PORT = 1883;
 static const char* MQTT_USER = "";   // laisser "" si le broker n'a pas d'authentification
@@ -34,8 +34,8 @@ static const char* TOPIC_STATUS = "resilience/backoffice/led/status";  // on pub
 
 // Broches de la LED. Si les couleurs sont inversées une fois branché,
 // il suffit d'échanger ces deux lignes.
-static const uint8_t PIN_ROUGE = D1;
-static const uint8_t PIN_VERT  = D2;
+static const uint8_t PIN_ROUGE = D2;
+static const uint8_t PIN_VERT  = D1;
 
 // Durées (millisecondes).
 static const unsigned long DUREE_FIXE       = 30000;  // vert/rouge fixe : 30 s
@@ -55,6 +55,8 @@ unsigned long dernierToggle = 0;  // pour cadencer les clignotements
 bool phaseAllumee = false;        // LED allumée ou non pendant un clignotement
 uint8_t clignEffectues = 0;       // nombre de clignotements rouges déjà faits
 unsigned long dernierEssaiMqtt = 0;
+unsigned long dernierWifiLog = 0;
+bool wifiEtaitConnecte = false;
 
 // Cathode commune : une couleur est allumée quand sa broche est à HIGH.
 void setLed(bool rouge, bool vert) {
@@ -177,11 +179,27 @@ void setup() {
 void loop() {
   majLed();  // la LED reste fluide quoi qu'il arrive
 
-  if (WiFi.status() == WL_CONNECTED && !mqtt.connected()) {
-    if (millis() - dernierEssaiMqtt > 2000) {
-      dernierEssaiMqtt = millis();
-      essayerMqtt();
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiEtaitConnecte) {
+      wifiEtaitConnecte = true;
+      Serial.print("Wi-Fi connecte, IP ");
+      Serial.println(WiFi.localIP());
+    }
+    if (!mqtt.connected()) {
+      if (millis() - dernierEssaiMqtt > 2000) {
+        dernierEssaiMqtt = millis();
+        essayerMqtt();
+      }
+    } else {
+      mqtt.loop();
+    }
+  } else {
+    wifiEtaitConnecte = false;
+    // Diagnostic : code d'état WiFi (1=SSID introuvable, 4=mauvais mot de passe, 6=en cours).
+    if (millis() - dernierWifiLog > 2000) {
+      dernierWifiLog = millis();
+      Serial.print("Wi-Fi status=");
+      Serial.println(WiFi.status());
     }
   }
-  if (mqtt.connected()) mqtt.loop();
 }

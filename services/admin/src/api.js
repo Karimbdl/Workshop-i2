@@ -79,7 +79,11 @@ export const api = {
 };
 
 // --- Face-agent : reconnaissance faciale + pilotage LED, sur le PC Hôte (hors passerelle). ---
-const FACE_AGENT = import.meta.env.VITE_FACE_AGENT || "http://localhost:8070";
+// 127.0.0.1 explicite (et pas « localhost ») : évite l'ambiguïté IPv4/IPv6 qui empêche
+// le flux vidéo de charger quand le site est servi en IPv6.
+const FACE_AGENT = import.meta.env.VITE_FACE_AGENT || "http://127.0.0.1:8070";
+export const faceStreamUrl = FACE_AGENT + "/stream";
+export const faceSnapshotUrl = FACE_AGENT + "/snapshot";
 
 async function faceCall(path, body) {
   let resp;
@@ -97,7 +101,7 @@ async function faceCall(path, body) {
 }
 
 export const face = {
-  recognize: () => faceCall("/recognize"),
+  recognize: (username) => faceCall("/recognize", { username }),
   led: (state) => faceCall("/led", { state }).catch(() => {}), // LED best-effort
 };
 

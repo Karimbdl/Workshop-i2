@@ -1,0 +1,1 @@
+# Pas de dépendance propre : httpx vient de common/requirements.txt.

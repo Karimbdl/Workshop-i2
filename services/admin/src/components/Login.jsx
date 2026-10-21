@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, ApiError, face, saveSession } from "../api.js";
+import { api, ApiError, face, faceSnapshotUrl, saveSession } from "../api.js";
 import { Alert, LedIndicator, Spinner } from "./ui.jsx";
 
 const ADMIN_ROLES = ["operator", "admin"];
@@ -24,16 +24,29 @@ export default function Login({ onAuthenticated }) {
   const [loading, setLoading] = useState(false);
   const [recognizing, setRecognizing] = useState(false);
   const [recognizedName, setRecognizedName] = useState(null);
+  const [confirmed, setConfirmed] = useState(false);
   const [faceAttempts, setFaceAttempts] = useState(0);
   const [blockedUntil, setBlockedUntil] = useState(0);
   const [now, setNow] = useState(Date.now());
   const timers = useRef([]);
+  const camRef = useRef(null);
 
   useEffect(() => () => timers.current.forEach(clearTimeout), []);
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
+  // Vidéo : on rafraîchit une image instantanée en boucle (plus fiable qu'un flux continu).
+  useEffect(() => {
+    if (step !== "face") return undefined;
+    let active = true;
+    const tick = () => {
+      if (active && camRef.current) camRef.current.src = `${faceSnapshotUrl}?t=${Date.now()}`;
+    };
+    tick();
+    const id = setInterval(tick, 140);
+    return () => { active = false; clearInterval(id); };
+  }, [step]);
   const later = (fn, ms) => timers.current.push(setTimeout(fn, ms));
 
   const blocked = blockedUntil > now;
@@ -49,6 +62,7 @@ export default function Login({ onAuthenticated }) {
     setMfaRequired(false);
     setUsername("");
     setRecognizedName(null);
+    setConfirmed(false);
     if (message) setError(message);
   }
 
@@ -66,14 +80,15 @@ export default function Login({ onAuthenticated }) {
     setRecognizing(true);
     setError(null);
     try {
-      const res = await face.recognize();
+      const res = await face.recognize(username.trim());
       setRecognizing(false);
       if (res.recognized) {
-        // Reconnu : LED vert clignotant, le mot de passe se débloque.
+        // Reconnu : LED vert clignotant. On montre la confirmation ~1,5 s avant le mot de passe.
         setRecognizedName(res.name);
         setFaceAttempts(0);
         setLed("green-blink");
-        setStep("password");
+        setConfirmed(true);
+        later(() => { setConfirmed(false); setStep("password"); }, 1600);
       } else {
         // Non reconnu : LED rouge fixe 30 s (gérée par l'ESP), puis on vide et on recommence.
         setLed("red");
@@ -201,21 +216,25 @@ export default function Login({ onAuthenticated }) {
           {/* Étape 2 — reconnaissance faciale */}
           {step === "face" && (
             <div className="space-y-4">
-              <div className="relative flex aspect-video items-center justify-center overflow-hidden rounded-2xl border border-grape-500/20 bg-slate-950/40">
-                <span className="scan-ring absolute h-24 w-24 rounded-full border-2 border-grape-400/50" />
-                <span className="scan-ring absolute h-24 w-24 rounded-full border-2 border-brand-400/50" style={{ animationDelay: "-1s" }} />
-                <span className="scan-line absolute left-[8%] right-[8%] h-px bg-gradient-to-r from-transparent via-grape-300 to-transparent" />
-                <div className="relative z-10 text-center">
-                  <div className="mx-auto mb-2 flex h-11 w-11 items-center justify-center rounded-full bg-grape-500/20 ring-1 ring-grape-400/40">
-                    <svg className="h-5 w-5 text-grape-200" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
-                      <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2" strokeLinecap="round" />
-                      <circle cx="12" cy="11" r="2.4" />
-                      <path d="M8.5 16.2a3.8 3.8 0 0 1 7 0" strokeLinecap="round" />
-                    </svg>
+              <div className="relative flex aspect-video items-center justify-center overflow-hidden rounded-2xl border border-grape-500/20 bg-slate-950/60">
+                {/* Vidéo en direct de la webcam USB (PC Hôte), par images rafraîchies. */}
+                <img ref={camRef} alt="Webcam" className="absolute inset-0 h-full w-full object-cover" />
+                <span className="scan-line absolute left-[6%] right-[6%] h-px bg-gradient-to-r from-transparent via-grape-300 to-transparent" />
+                {recognizing && !confirmed && (
+                  <div className="absolute bottom-2 left-2 inline-flex items-center gap-2 rounded-lg bg-slate-950/70 px-2.5 py-1 text-xs font-medium text-grape-200 ring-1 ring-grape-400/30">
+                    <Spinner /> Analyse du visage…
                   </div>
-                  <p className="text-sm font-medium text-slate-200">{recognizing ? "Analyse du visage…" : "Caméra active"}</p>
-                  <p className="mt-0.5 text-xs text-slate-500">Webcam du PC Hôte</p>
-                </div>
+                )}
+                {confirmed && (
+                  <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 bg-emerald-950/70 backdrop-blur-sm animate-fade-up">
+                    <div className="flex h-14 w-14 items-center justify-center rounded-full bg-emerald-500 text-white shadow-lg shadow-emerald-500/40">
+                      <svg className="h-7 w-7" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                        <path d="M5 13l4 4L19 7" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </div>
+                    <p className="text-sm font-semibold text-emerald-200">Visage reconnu · {recognizedName}</p>
+                  </div>
+                )}
               </div>
               <p className="text-center text-xs text-slate-500">Identifiant : <span className="text-slate-300">{username}</span></p>
               <button type="button" className="btn-ghost w-full" onClick={() => resetToId()} disabled={recognizing}>Annuler</button>
