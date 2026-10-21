@@ -50,7 +50,7 @@ services:
       - ./infra/gateway/default.conf.template:/etc/nginx/templates/conf.d/default.conf.template:ro
       - ./infra/gateway/blocklist:/etc/nginx/blocklist:ro
     networks: [edge, app]
-    depends_on: [frontend]
+    depends_on: [frontend, admin-frontend]
     healthcheck:
       # En-tête Host explicite : une adresse IP brute déclenche une règle du WAF et polluerait les journaux.
       test: ["CMD-SHELL", "wget -q --header 'Host: localhost' -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
@@ -68,6 +68,17 @@ services:
     <<: *hardening
     build: ./services/frontend
     image: resilience-alpha/frontend:dev
+    tmpfs: ["/tmp", "/var/cache/nginx"]
+    networks: [app]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 64M, pids: 200 }
+
+  # Console d'administration (React), servie par la passerelle sous /console/.
+  admin-frontend:
+    <<: *hardening
+    build: ./services/admin
+    image: resilience-alpha/admin-frontend:dev
     tmpfs: ["/tmp", "/var/cache/nginx"]
     networks: [app]
     deploy:
@@ -230,7 +241,11 @@ services:
       GATEWAY_URL: http://gateway:8080
       LEDGER_URL: http://ledger-service:8000
       DOCKER_PROXY_URL: http://docker-proxy-rw:2375
+      BLOCKLIST_PATH: /etc/nginx/blocklist/banned.conf
     secrets: [internal_token, seed_users]
+    # Accès en écriture à la liste de blocage de la passerelle (rechargée à chaud).
+    volumes:
+      - ./infra/gateway/blocklist:/etc/nginx/blocklist:rw
     networks: [app, obs, dockerapi-rw]
     deploy:
       resources:

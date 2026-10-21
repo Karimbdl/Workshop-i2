@@ -36,6 +36,12 @@ SessionLocal = make_session_factory(engine)
 TRANSFERS = Counter("ledger_transfers_total", "Virements traités par le grand livre", ["result"])
 INTEGRITY_OK = Gauge("ledger_integrity_ok", "1 si le grand livre est cohérent, 0 sinon")
 INTEGRITY_ANOMALIES = Gauge("ledger_integrity_anomalies", "Nombre d'anomalies détectées dans le grand livre")
+FROZEN = Gauge("ledger_frozen", "1 si le grand livre est gelé (aucun virement accepté), 0 sinon")
+
+# Gel global : mesure d'urgence déclenchée depuis la console. Tant qu'il est actif,
+# tous les virements sont refusés (423). L'état est en mémoire : un redémarrage le lève.
+_freeze = {"on": False, "reason": None}
+FROZEN.set(0)
 
 
 def run_integrity_check() -> dict:
@@ -121,6 +127,13 @@ class TransferIn(BaseModel):
 
 @app.post("/internal/transfers", dependencies=[Depends(require_internal_token)])
 def create_transfer(body: TransferIn):
+    if _freeze["on"]:
+        TRANSFERS.labels("frozen").inc()
+        log_event(logger, "transfer_refused_frozen", logging.WARNING, transfer_id=str(body.transfer_id))
+        return JSONResponse(
+            status_code=status.HTTP_423_LOCKED,
+            content={"code": "ledger_frozen", "detail": "Grand livre gelé, virement refusé"},
+        )
     with SessionLocal() as session:
         try:
             result = execute_transfer(
@@ -194,6 +207,31 @@ def freeze(iban: str, body: FreezeIn):
 @app.post("/internal/accounts/{iban}/unfreeze", dependencies=[Depends(require_internal_token)])
 def unfreeze(iban: str, body: FreezeIn):
     return set_account_status(iban, "ACTIVE", body.reason)
+
+
+@app.get("/internal/freeze-status", dependencies=[Depends(require_internal_token)])
+def freeze_status():
+    return {"frozen": _freeze["on"], "reason": _freeze["reason"]}
+
+
+@app.post("/internal/freeze-all", dependencies=[Depends(require_internal_token)])
+def freeze_all(body: FreezeIn):
+    """Gèle tout le grand livre : plus aucun virement n'est accepté."""
+    _freeze["on"] = True
+    _freeze["reason"] = body.reason
+    FROZEN.set(1)
+    log_event(logger, "ledger_frozen", logging.WARNING, reason=body.reason)
+    return {"frozen": True, "reason": body.reason}
+
+
+@app.post("/internal/unfreeze-all", dependencies=[Depends(require_internal_token)])
+def unfreeze_all(body: FreezeIn):
+    """Lève le gel global : les virements reprennent."""
+    _freeze["on"] = False
+    _freeze["reason"] = body.reason
+    FROZEN.set(0)
+    log_event(logger, "ledger_unfrozen", reason=body.reason)
+    return {"frozen": False, "reason": body.reason}
 
 
 @app.get("/health")

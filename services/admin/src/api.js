@@ -76,6 +76,26 @@ export const api = {
   incidents: (token) => request("/admin/incidents", { token }),
   services: (token) => request("/admin/services", { token }),
   remediations: (token) => request("/admin/remediations", { token }),
+
+  // --- Actions de supervision (admin-api -> moteur de remédiation). ---
+  blocklist: (token) => request("/admin/blocklist", { token }),
+  actions: {
+    remediate: (token) => request("/admin/actions/remediate", { token, method: "POST" }),
+    blockIp: (token, ip) => request("/admin/actions/block-ip", { token, method: "POST", body: { ip } }),
+    unblockIp: (token, ip) => request("/admin/actions/unblock-ip", { token, method: "POST", body: { ip } }),
+    freezeLedger: (token, freeze, reason) =>
+      request("/admin/actions/freeze-ledger", { token, method: "POST", body: { freeze, reason } }),
+  },
+
+  // --- Habilitations (auth-service, réservé aux administrateurs). ---
+  users: {
+    list: (token) => request("/auth/users", { token }),
+    create: (token, body) => request("/auth/users", { token, method: "POST", body }),
+    update: (token, username, body) =>
+      request(`/auth/users/${encodeURIComponent(username)}`, { token, method: "PATCH", body }),
+    remove: (token, username) =>
+      request(`/auth/users/${encodeURIComponent(username)}`, { token, method: "DELETE" }),
+  },
 };
 
 // --- Face-agent : reconnaissance faciale + pilotage LED, sur le PC Hôte (hors passerelle). ---
@@ -85,11 +105,11 @@ const FACE_AGENT = import.meta.env.VITE_FACE_AGENT || "http://127.0.0.1:8070";
 export const faceStreamUrl = FACE_AGENT + "/stream";
 export const faceSnapshotUrl = FACE_AGENT + "/snapshot";
 
-async function faceCall(path, body) {
+async function faceCall(path, { method = "POST", body } = {}) {
   let resp;
   try {
     resp = await fetch(FACE_AGENT + path, {
-      method: "POST",
+      method,
       headers: body ? { "Content-Type": "application/json" } : {},
       body: body ? JSON.stringify(body) : undefined,
     });
@@ -101,8 +121,11 @@ async function faceCall(path, body) {
 }
 
 export const face = {
-  recognize: (username) => faceCall("/recognize", { username }),
-  led: (state) => faceCall("/led", { state }).catch(() => {}), // LED best-effort
+  recognize: (username) => faceCall("/recognize", { body: { username } }),
+  led: (state) => faceCall("/led", { body: { state } }).catch(() => {}), // LED best-effort
+  list: () => faceCall("/faces", { method: "GET" }),
+  enroll: (name, shots = 7) => faceCall("/enroll", { body: { name, shots } }),
+  remove: (name) => faceCall(`/faces/${encodeURIComponent(name)}`, { method: "DELETE" }),
 };
 
 export function formatTime(iso) {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, formatTime } from "../api.js";
 import { Alert, Pill, Spinner } from "./ui.jsx";
+import Habilitations from "./Habilitations.jsx";
 
 const REFRESH_MS = 10_000;
 const GRAVITE_TONE = { "élevée": "rose", "moyenne": "amber", "faible": "slate" };
@@ -13,20 +14,29 @@ export default function Console({ session, onLogout }) {
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [updatedAt, setUpdatedAt] = useState(null);
+  const [tab, setTab] = useState("supervision");
+  const [blocklist, setBlocklist] = useState([]);
+  const [ip, setIp] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [action, setAction] = useState(null); // { tone, msg }
   const timer = useRef(null);
+  const isAdmin = session.role === "admin";
 
   const refresh = useCallback(async () => {
     try {
-      const [ov, inc, svc, rem] = await Promise.all([
+      const [ov, inc, svc, rem, bl] = await Promise.all([
         api.overview(session.token),
         api.incidents(session.token),
         api.services(session.token),
         api.remediations(session.token),
+        // Liste de blocage : passe par le moteur ; échec non bloquant pour la console.
+        api.blocklist(session.token).catch(() => ({ data: { banned: [] } })),
       ]);
       setOverview(ov.data);
       setIncidents(inc.data.incidents || []);
       setServices(svc.data.services || []);
       setRemediations({ list: rem.data.remediations || [], engineConnected: rem.data.engine_connected });
+      setBlocklist(bl.data.banned || []);
       setError(null);
       setUpdatedAt(Date.now());
     } catch (err) {
@@ -46,6 +56,32 @@ export default function Console({ session, onLogout }) {
     timer.current = setInterval(refresh, REFRESH_MS);
     return () => clearInterval(timer.current);
   }, [refresh]);
+
+  // Exécute une action privilégiée, affiche le résultat, puis rafraîchit.
+  async function runAction(fn, successMsg) {
+    setBusy(true);
+    setAction(null);
+    try {
+      const { data } = await fn();
+      if (data && data.ok === false) setAction({ tone: "warning", msg: data.detail || "Action refusée." });
+      else setAction({ tone: "success", msg: successMsg });
+      await refresh();
+    } catch (err) {
+      setAction({ tone: "warning", msg: err.message || "Action impossible." });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const frozen = overview?.ledger_frozen === true;
+
+  function blockSubmit(e) {
+    e.preventDefault();
+    const value = ip.trim();
+    if (!value) return;
+    runAction(() => api.actions.blockIp(session.token, value), `Adresse ${value} bloquée.`);
+    setIp("");
+  }
 
   const phase = overview?.detector_state;
   const score = overview?.anomaly_score;
@@ -83,6 +119,26 @@ export default function Console({ session, onLogout }) {
       </header>
 
       <main className="mx-auto max-w-6xl space-y-6 px-4 py-6">
+        {isAdmin && (
+          <nav className="flex gap-1 rounded-xl bg-slate-900/60 p-1 ring-1 ring-slate-800 sm:w-max">
+            {[["supervision", "Supervision"], ["habilitations", "Habilitations"]].map(([key, label]) => (
+              <button
+                key={key}
+                onClick={() => setTab(key)}
+                className={`rounded-lg px-4 py-1.5 text-sm font-medium transition-colors ${
+                  tab === key ? "bg-gradient-to-r from-brand-500/20 to-grape-500/20 text-grape-100 ring-1 ring-grape-500/30" : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </nav>
+        )}
+
+        {tab === "habilitations" && isAdmin ? (
+          <Habilitations session={session} />
+        ) : (
+        <>
         <div className="flex items-center justify-between">
           <p className="text-xs text-slate-500">
             {loading ? "Chargement…" : updatedAt ? `Mis à jour ${formatTime(updatedAt)}` : ""}
@@ -100,6 +156,61 @@ export default function Console({ session, onLogout }) {
               <div className="mt-1 text-xs text-slate-400">{k.label}</div>
             </div>
           ))}
+        </section>
+
+        {/* Actions de supervision */}
+        <section className="panel p-5">
+          <div className="mb-4 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-slate-200">Actions</h2>
+            {frozen && <Pill tone="rose">grand livre gelé</Pill>}
+          </div>
+          {action && <div className="mb-4"><Alert tone={action.tone}>{action.msg}</Alert></div>}
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              className="btn-primary"
+              disabled={busy || !overview?.incident_active}
+              onClick={() => runAction(() => api.actions.remediate(session.token), "Remédiation lancée.")}
+            >
+              Lancer une remédiation
+            </button>
+            <button
+              className="btn-ghost ring-1 ring-slate-700"
+              disabled={busy}
+              onClick={() => runAction(
+                () => api.actions.freezeLedger(session.token, !frozen, frozen ? "Dégel manuel (console)" : "Gel manuel (console)"),
+                frozen ? "Grand livre dégelé." : "Grand livre gelé.",
+              )}
+            >
+              {frozen ? "Dégeler le grand livre" : "Geler le grand livre"}
+            </button>
+          </div>
+
+          <form onSubmit={blockSubmit} className="mt-4 flex flex-wrap items-end gap-2">
+            <div>
+              <label className="label">Bloquer une adresse IP</label>
+              <input className="field w-56" value={ip} onChange={(e) => setIp(e.target.value)} placeholder="ex. 203.0.113.5" />
+            </div>
+            <button type="submit" className="btn-ghost ring-1 ring-slate-700" disabled={busy}>Bloquer</button>
+          </form>
+
+          {blocklist.length > 0 && (
+            <div className="mt-4">
+              <p className="mb-2 text-xs uppercase tracking-wide text-slate-500">Adresses bloquées</p>
+              <ul className="flex flex-wrap gap-2">
+                {blocklist.map((b) => (
+                  <li key={b} className="inline-flex items-center gap-2 rounded-lg bg-slate-800/60 px-2.5 py-1 text-sm ring-1 ring-slate-700">
+                    <span className="font-mono text-slate-200">{b}</span>
+                    <button className="text-xs text-slate-400 hover:text-rose-300" disabled={busy}
+                      onClick={() => runAction(() => api.actions.unblockIp(session.token, b), `Adresse ${b} débloquée.`)}>
+                      débloquer
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <p className="mt-3 text-xs text-slate-500">« Lancer une remédiation » agit sur l'incident en cours ; sans incident, le bouton reste inactif.</p>
         </section>
 
         <div className="grid gap-6 lg:grid-cols-3">
@@ -188,6 +299,8 @@ export default function Console({ session, onLogout }) {
             <p className="text-sm text-slate-500"><Spinner /></p>
           )}
         </section>
+        </>
+        )}
       </main>
     </div>
   );

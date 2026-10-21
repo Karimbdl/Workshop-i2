@@ -19,8 +19,9 @@ from sqlalchemy import select
 
 from resilience_common.db import db_is_ready, make_engine, make_session_factory, wait_for_db
 from resilience_common.http import client_ip, setup_http
+from resilience_common.identity import user_uuid
 from resilience_common.logs import log_event, setup_logging
-from resilience_common.security import AUDIENCE, ISSUER
+from resilience_common.security import AUDIENCE, ISSUER, Principal, require_roles
 
 from .keys import key_store
 from .limiter import LoginLimiter
@@ -159,6 +160,100 @@ def me(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)):
 @app.get("/.well-known/jwks.json")
 def jwks():
     return {"keys": [key_store.current().jwk]}
+
+
+# --- Gestion des habilitations (back-office) : réservée aux administrateurs. ---
+# Création, listage, activation/désactivation et suppression des comptes de
+# supervision (opérateurs et administrateurs). La MFA est obligatoire pour ces
+# rôles : à la création, on génère un secret TOTP et on renvoie l'URI à scanner.
+
+admin_only = require_roles("admin")
+STAFF_ROLES = {"operator", "admin"}
+
+
+def user_view(user: User) -> dict:
+    return {
+        "username": user.username,
+        "display_name": user.display_name,
+        "role": user.role,
+        "is_active": user.is_active,
+        "mfa_enabled": bool(user.mfa_secret),
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+    }
+
+
+class CreateUserIn(BaseModel):
+    username: str = Field(min_length=3, max_length=64, pattern=r"^[a-zA-Z0-9_.-]+$")
+    display_name: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=8, max_length=128)
+    role: str = Field(pattern=r"^(operator|admin)$")
+
+
+class UpdateUserIn(BaseModel):
+    is_active: bool | None = None
+    password: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+@app.get("/auth/users")
+def list_users(_: Principal = Depends(admin_only)):
+    with SessionLocal() as session:
+        users = session.scalars(select(User).order_by(User.created_at)).all()
+        return {"users": [user_view(u) for u in users]}
+
+
+@app.post("/auth/users", status_code=status.HTTP_201_CREATED)
+def create_user(body: CreateUserIn, principal: Principal = Depends(admin_only)):
+    with SessionLocal() as session:
+        if session.scalar(select(User).where(User.username == body.username)):
+            raise HTTPException(status.HTTP_409_CONFLICT, "Cet identifiant existe déjà")
+        secret = pyotp.random_base32()
+        user = User(
+            id=user_uuid(body.username),
+            username=body.username,
+            display_name=body.display_name,
+            password_hash=hasher.hash(body.password),
+            role=body.role,
+            mfa_secret=secret,
+        )
+        session.add(user)
+        session.commit()
+        view = user_view(user)
+    otp_uri = pyotp.TOTP(secret).provisioning_uri(name=body.username, issuer_name="RESILIENCE-ALPHA")
+    log_event(logger, "user_created", username=body.username, role=body.role, by=principal.username)
+    # Le secret MFA n'est renvoyé qu'une fois, à la création, pour être scanné.
+    return {**view, "mfa_secret": secret, "otp_uri": otp_uri}
+
+
+@app.patch("/auth/users/{username}")
+def update_user(username: str, body: UpdateUserIn, principal: Principal = Depends(admin_only)):
+    with SessionLocal() as session:
+        user = session.scalar(select(User).where(User.username == username))
+        if user is None or user.role not in STAFF_ROLES:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Compte introuvable")
+        if body.is_active is not None:
+            if not body.is_active and user.username == principal.username:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "Impossible de désactiver son propre compte")
+            user.is_active = body.is_active
+        if body.password is not None:
+            user.password_hash = hasher.hash(body.password)
+        session.commit()
+        view = user_view(user)
+    log_event(logger, "user_updated", username=username, by=principal.username)
+    return view
+
+
+@app.delete("/auth/users/{username}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user(username: str, principal: Principal = Depends(admin_only)):
+    if username == principal.username:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Impossible de supprimer son propre compte")
+    with SessionLocal() as session:
+        user = session.scalar(select(User).where(User.username == username))
+        if user is None or user.role not in STAFF_ROLES:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Compte introuvable")
+        session.delete(user)
+        session.commit()
+    log_event(logger, "user_deleted", username=username, by=principal.username)
 
 
 @app.get("/health")

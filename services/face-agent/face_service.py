@@ -43,6 +43,13 @@ _frame_lock = threading.Lock()
 _latest = None          # dernière image de la webcam (BGR)
 _running = True
 
+# Chien de garde caméra : au bout de plusieurs images noires d'affilée (webcam
+# happée par un autre programme, câble, veille…), on referme et on rouvre la
+# webcam pour récupérer tout seul. Une image est « noire » si sa luminosité
+# moyenne est quasi nulle.
+BLACK_MEAN = 6.0          # seuil de luminosité moyenne (0 = noir total)
+BLACK_FRAMES_BEFORE_RESET = 25  # ~1,5 s d'images noires avant de rouvrir
+
 
 def _load_faces():
     if os.path.exists(fl.FACES_PATH):
@@ -51,22 +58,50 @@ def _load_faces():
     return {}
 
 
+def _reopen(cam):
+    """Referme proprement la webcam et la rouvre."""
+    try:
+        if cam is not None:
+            cam.release()
+    except Exception:
+        pass
+    time.sleep(0.3)
+    return fl.open_camera()
+
+
 def _capture_loop():
-    """Lit la webcam en continu et garde la dernière image."""
+    """Lit la webcam en continu et garde la dernière image.
+
+    Surveille aussi les images noires : si la webcam renvoie du noir trop
+    longtemps, on la rouvre automatiquement (récupération sans intervention).
+    """
     global _latest
     cam = None
+    black_streak = 0
     while _running:
         try:
             if cam is None or not cam.isOpened():
                 cam = fl.open_camera()  # auto : webcam USB
+                black_streak = 0
             ok, frame = cam.read()
-            if ok:
+            if not ok or frame is None:
+                time.sleep(0.05)
+                continue
+            # Détection d'image noire (webcam prise par un autre process, etc.).
+            if float(frame.mean()) < BLACK_MEAN:
+                black_streak += 1
+                if black_streak >= BLACK_FRAMES_BEFORE_RESET:
+                    cam = _reopen(cam)
+                    black_streak = 0
+                    continue
+            else:
+                black_streak = 0
                 with _frame_lock:
                     _latest = frame
-            else:
-                time.sleep(0.05)
         except Exception:
-            time.sleep(0.5)
+            cam = _reopen(cam)
+            black_streak = 0
+            time.sleep(0.3)
     if cam is not None:
         cam.release()
 
@@ -243,6 +278,26 @@ def enroll(body: EnrollIn):
         json.dump(known, f)
     _known = known
     return {"ok": True, "name": name, "shots": len(feats), "enrolled": list(known)}
+
+
+@app.get("/faces")
+def list_faces():
+    """Liste des visages enrôlés (sans les données biométriques)."""
+    return {"enrolled": sorted(_known), "count": len(_known)}
+
+
+@app.delete("/faces/{name}")
+def delete_face(name: str):
+    """Retire un visage enrôlé."""
+    global _known
+    known = _load_faces()
+    if name not in known:
+        return {"ok": False, "detail": f"Visage « {name} » introuvable."}
+    del known[name]
+    with open(fl.FACES_PATH, "w", encoding="utf-8") as f:
+        json.dump(known, f)
+    _known = known
+    return {"ok": True, "enrolled": sorted(known)}
 
 
 @app.post("/reload")

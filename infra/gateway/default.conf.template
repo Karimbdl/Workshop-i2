@@ -33,6 +33,7 @@ map $host $payment_upstream  { default "payment-api:8000"; }
 map $host $ledger_upstream   { default "ledger-service:8000"; }
 map $host $admin_upstream    { default "admin-api:8000"; }
 map $host $frontend_upstream { default "frontend:8080"; }
+map $host $admin_front_upstream { default "admin-frontend:8080"; }
 
 server {
     listen ${PORT} default_server;
@@ -99,6 +100,21 @@ server {
     # Tout le reste de /api (dont /internal, /metrics, /docs) est refusé.
     location /api/ {
         return 404;
+    }
+
+    # Console d'administration (SPA React). Servie sous /console/ ; la passerelle
+    # retire le préfixe avant de transmettre au conteneur admin-frontend.
+    location = /console { return 301 /console/; }
+
+    location /console/ {
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "DENY" always;
+        add_header Referrer-Policy "no-referrer" always;
+        # La console parle au face-agent (reconnaissance + vidéo) sur l'hôte en 8070 :
+        # on l'autorise explicitement dans connect-src et img-src, sans ouvrir l'espace client.
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; img-src 'self' data: http://127.0.0.1:8070; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' http://127.0.0.1:8070; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" always;
+        rewrite ^/console/(.*)$ /$1 break;
+        proxy_pass http://$admin_front_upstream;
     }
 
     location / {

@@ -12,9 +12,10 @@ import os
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from pydantic import BaseModel, Field
 
-from resilience_common.http import setup_http
+from resilience_common.http import client_ip, setup_http
 from resilience_common.logs import log_event, setup_logging
 from resilience_common.secrets import read_secret
 from resilience_common.security import Principal, require_roles
@@ -146,6 +147,14 @@ def overview(principal: Principal = Depends(staff_only)):
     except Exception as exc:  # métrique absente ou Prometheus indisponible : non bloquant
         log_event(logger, "waf_metric_unavailable", logging.WARNING, error=str(exc))
 
+    ledger_frozen = None
+    try:
+        res = prom_query("ledger_frozen")
+        if res:
+            ledger_frozen = float(res[0]["value"][1]) >= 1
+    except Exception as exc:
+        log_event(logger, "freeze_metric_unavailable", logging.WARNING, error=str(exc))
+
     return {
         "detector_state": status.get("state"),
         "anomaly_score": status.get("anomaly_score"),
@@ -153,6 +162,7 @@ def overview(principal: Principal = Depends(staff_only)):
         "services_up": up,
         "services_total": len(services),
         "waf_blocked_total": waf_total,
+        "ledger_frozen": ledger_frozen,
         "checked_at": _iso(),
     }
 
@@ -189,3 +199,70 @@ def remediations(principal: Principal = Depends(staff_only)):
     except Exception as exc:
         log_event(logger, "remediation_unavailable", logging.WARNING, error=str(exc))
         return {"remediations": [], "engine_connected": False, "checked_at": _iso()}
+
+
+# ------------------------------------------------------------------- Actions
+# Les actions privilégiées (remédiation, blocage d'IP, gel du grand livre) sont
+# exécutées par le moteur de remédiation, seul détenteur du jeton interne et des
+# accès Docker/ledger. admin-api ne fait que relayer, après contrôle du rôle.
+
+ENGINE_ACTION_TIMEOUT = float(os.getenv("ENGINE_ACTION_TIMEOUT_SECONDS", "20"))
+
+
+def engine_call(method: str, path: str, payload: dict | None = None, timeout: float | None = None):
+    try:
+        with httpx.Client(timeout=timeout or HTTP_TIMEOUT) as client:
+            resp = client.request(
+                method, f"{REMEDIATION_URL}{path}",
+                headers={"X-Internal-Token": INTERNAL_TOKEN or ""},
+                json=payload,
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:
+        log_event(logger, "engine_call_failed", logging.WARNING, path=path, error=str(exc))
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Moteur de remédiation injoignable")
+
+
+class IpIn(BaseModel):
+    ip: str = Field(min_length=3, max_length=45)
+
+
+class FreezeIn(BaseModel):
+    freeze: bool
+    reason: str = Field(default="Action console", min_length=3, max_length=200)
+
+
+@app.get("/admin/blocklist")
+def get_blocklist(principal: Principal = Depends(staff_only)):
+    """Adresses IP actuellement bloquées par la passerelle."""
+    data = engine_call("GET", "/internal/blocklist")
+    return {"banned": data.get("banned", []), "checked_at": _iso()}
+
+
+@app.post("/admin/actions/remediate")
+def action_remediate(principal: Principal = Depends(staff_only)):
+    """Force une remédiation sur l'incident en cours."""
+    log_event(logger, "action_remediate", by=principal.username)
+    return engine_call("POST", "/internal/trigger", timeout=ENGINE_ACTION_TIMEOUT)
+
+
+@app.post("/admin/actions/block-ip")
+def action_block_ip(body: IpIn, request: Request, principal: Principal = Depends(staff_only)):
+    # Garde-fou : ne pas bloquer l'adresse de l'opérateur lui-même (auto-déconnexion).
+    if body.ip.strip() == client_ip(request):
+        return {"ok": False, "detail": "Refusé : c'est votre propre adresse, vous seriez déconnecté."}
+    log_event(logger, "action_block_ip", by=principal.username, ip=body.ip)
+    return engine_call("POST", "/internal/block-ip", {"ip": body.ip})
+
+
+@app.post("/admin/actions/unblock-ip")
+def action_unblock_ip(body: IpIn, principal: Principal = Depends(staff_only)):
+    log_event(logger, "action_unblock_ip", by=principal.username, ip=body.ip)
+    return engine_call("POST", "/internal/unblock-ip", {"ip": body.ip})
+
+
+@app.post("/admin/actions/freeze-ledger")
+def action_freeze_ledger(body: FreezeIn, principal: Principal = Depends(staff_only)):
+    log_event(logger, "action_freeze_ledger", by=principal.username, freeze=body.freeze)
+    return engine_call("POST", "/internal/freeze-ledger", {"freeze": body.freeze, "reason": body.reason})
