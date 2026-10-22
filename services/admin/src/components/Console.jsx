@@ -7,6 +7,52 @@ import Assistant from "./Assistant.jsx";
 const REFRESH_MS = 10_000;
 const GRAVITE_TONE = { "élevée": "rose", "moyenne": "amber", "faible": "slate" };
 
+// Une remédiation = une carte qui déroule les 3 étapes (détection, réparation,
+// paiement témoin). La plus récente est mise en avant.
+function RemediationCard({ r, recent }) {
+  const etapes = r.etapes || [
+    { titre: "Incident détecté", detail: r.label || r.incident, info: (r.causes || []).join(", "), ok: true },
+    { titre: "Réparation appliquée", detail: r.action, info: "", ok: true },
+    { titre: "Paiement témoin", detail: r.resultat, info: "", ok: r.verified },
+  ];
+  return (
+    <article className={`rounded-xl p-4 ring-1 ${recent ? "bg-slate-900/70 ring-grape-500/40" : "bg-slate-900/40 ring-slate-800"}`}>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <span className="text-xs text-slate-400">{formatTime(r.at)}</span>
+        <span className="font-medium text-slate-100">{r.label || r.incident}</span>
+        {r.gravite && <Pill tone={GRAVITE_TONE[r.gravite] || "slate"}>gravité {r.gravite}</Pill>}
+        {recent && <Pill tone="brand">dernière</Pill>}
+        <span className="ml-auto">
+          {r.verified
+            ? <Pill tone="emerald">✓ reprise vérifiée</Pill>
+            : <Pill tone="amber">reprise non confirmée</Pill>}
+        </span>
+      </div>
+
+      {/* Déroulé en 3 étapes */}
+      <ol className="grid gap-3 sm:grid-cols-3">
+        {etapes.map((e, i) => (
+          <li key={i} className="relative rounded-lg bg-slate-950/40 p-3 ring-1 ring-slate-800">
+            <div className="mb-1 flex items-center gap-2">
+              <span className={`flex h-5 w-5 items-center justify-center rounded-full text-xs font-bold ${
+                e.ok ? "bg-emerald-500/20 text-emerald-300" : "bg-amber-500/20 text-amber-300"}`}>
+                {e.ok ? "✓" : "!"}
+              </span>
+              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">{e.titre}</span>
+            </div>
+            <div className="text-sm text-slate-200">{e.detail}</div>
+            {e.info && <div className="mt-0.5 text-xs text-slate-500">{e.info}</div>}
+          </li>
+        ))}
+      </ol>
+
+      {typeof r.duree_s === "number" && (
+        <div className="mt-2 text-right text-xs text-slate-600">réparée en {r.duree_s}s</div>
+      )}
+    </article>
+  );
+}
+
 export default function Console({ session, onLogout }) {
   const [overview, setOverview] = useState(null);
   const [incidents, setIncidents] = useState([]);
@@ -266,35 +312,23 @@ export default function Console({ session, onLogout }) {
 
         {/* Historique des remédiations */}
         <section className="panel p-5">
-          <h2 className="mb-4 text-sm font-semibold text-slate-200">Historique des remédiations</h2>
+          <div className="mb-4 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-slate-200">Historique des remédiations</h2>
+            {remediations?.list?.length > 0 && (
+              <span className="text-xs text-slate-500">{remediations.list.length} remédiation{remediations.list.length > 1 ? "s" : ""}</span>
+            )}
+          </div>
           {remediations && remediations.list.length === 0 ? (
             <Alert tone="info">
               {remediations.engineConnected
-                ? "Aucune remédiation."
+                ? "Aucune remédiation pour l'instant. Les réparations automatiques s'afficheront ici."
                 : "Moteur de remédiation pas encore branché."}
             </Alert>
           ) : remediations ? (
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-sm">
-                <thead className="text-xs uppercase tracking-wide text-slate-500">
-                  <tr className="border-b border-slate-800">
-                    <th className="pb-2 pr-4 font-semibold">Heure</th>
-                    <th className="pb-2 pr-4 font-semibold">Incident</th>
-                    <th className="pb-2 pr-4 font-semibold">Action</th>
-                    <th className="pb-2 font-semibold">Résultat</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800/70">
-                  {remediations.list.map((r, idx) => (
-                    <tr key={idx} className="text-slate-300">
-                      <td className="py-2 pr-4 whitespace-nowrap text-slate-400">{formatTime(r.at)}</td>
-                      <td className="py-2 pr-4"><span className="font-medium text-slate-200">{r.incident}</span></td>
-                      <td className="py-2 pr-4">{r.action}</td>
-                      <td className="py-2"><Pill tone="emerald">{r.resultat}</Pill></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            <div className="space-y-3">
+              {remediations.list.map((r, idx) => (
+                <RemediationCard key={idx} r={r} recent={idx === 0} />
+              ))}
             </div>
           ) : (
             <p className="text-sm text-slate-500"><Spinner /></p>

@@ -229,13 +229,23 @@ def _probe_once():
 
 # ---------------------------------------------------------------- Orchestration
 
+# Gravité par type d'incident (pour l'affichage de la console).
+GRAVITE = {
+    "integrite": "élevée", "intrusion_applicative": "élevée", "force_brute": "élevée",
+    "disponibilite": "moyenne", "surcharge": "moyenne", "degradation": "faible",
+}
+
+
 def remediate(incident: dict):
+    import time as _t
     itype = incident.get("type", "inconnu")
+    t0 = _t.monotonic()
     log_event(logger, "remediation_debut", type=itype)
     try:
         action, details = playbook(itype)
+        action_ok = True
     except Exception as exc:
-        action, details = "Échec de la réparation", {"error": str(exc)}
+        action, details, action_ok = "Échec de la réparation", {"error": str(exc)}, False
         log_event(logger, "remediation_erreur", logging.ERROR, type=itype, error=str(exc))
 
     try:
@@ -243,19 +253,52 @@ def remediate(incident: dict):
     except Exception as exc:
         verif = {"ok": False, "status": str(exc)}
 
-    resultat = "paiement témoin OK" if verif.get("ok") else f"témoin : {verif.get('status')}"
+    verified = bool(verif.get("ok"))
+    resultat = "paiement témoin OK" if verified else f"témoin : {verif.get('status')}"
+    duree = round(_t.monotonic() - t0, 1)
+
+    # Déroulé en 3 étapes, pour un affichage lisible côté console.
+    etapes = [
+        {"titre": "Incident détecté", "detail": incident.get("label", itype),
+         "info": ", ".join(incident.get("causes", [])), "ok": True},
+        {"titre": "Réparation appliquée", "detail": action,
+         "info": _detail_lisible(itype, details), "ok": action_ok},
+        {"titre": "Paiement témoin", "detail": f"{PROBE_AMOUNT:.2f} € via la passerelle",
+         "info": f"statut {verif.get('status')}" + (f" · n° {verif.get('payment_id', '')[:8]}" if verif.get("payment_id") else ""),
+         "ok": verified},
+    ]
     record = {
         "at": _iso(),
         "incident": itype,
         "label": incident.get("label", itype),
+        "gravite": GRAVITE.get(itype, "moyenne"),
+        "causes": incident.get("causes", []),
         "action": action,
         "resultat": resultat,
-        "verified": bool(verif.get("ok")),
+        "verified": verified,
+        "duree_s": duree,
+        "probe": {"ok": verified, "status": verif.get("status"),
+                  "payment_id": verif.get("payment_id"), "amount": PROBE_AMOUNT},
+        "etapes": etapes,
         "details": details,
     }
     _history.appendleft(record)
-    log_event(logger, "remediation_fin", type=itype, verified=record["verified"], action=action)
+    log_event(logger, "remediation_fin", type=itype, verified=verified, action=action, duree_s=duree)
     return record
+
+
+def _detail_lisible(itype: str, details: dict) -> str:
+    """Rend les détails techniques d'une réparation en une courte phrase."""
+    if not details:
+        return ""
+    if "restarted" in details:
+        lst = details["restarted"]
+        return ("services redémarrés : " + ", ".join(lst)) if lst else "aucun service à redémarrer"
+    if "integrity_ok" in details:
+        return "grand livre cohérent" if details["integrity_ok"] else "incohérence détectée"
+    if "error" in details:
+        return str(details["error"])[:120]
+    return ""
 
 
 async def loop():
