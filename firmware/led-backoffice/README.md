@@ -7,8 +7,8 @@ reçu par MQTT (reconnaissance faciale et saisie du mot de passe au login).
 
 | Broche ESP | vers | Patte LED |
 |---|---|---|
-| D1 | résistance 220 Ω | verte |
-| D2 | résistance 220 Ω | rouge |
+| D1 | résistance 220 Ω | rouge |
+| D2 | résistance 220 Ω | verte |
 | G  | fil direct | commune (la plus longue) |
 
 ## Ouvrir et téléverser (CLion + PlatformIO)

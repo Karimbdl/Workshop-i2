@@ -34,8 +34,8 @@ static const char* TOPIC_STATUS = "resilience/backoffice/led/status";  // on pub
 
 // Broches de la LED. Si les couleurs sont inversées une fois branché,
 // il suffit d'échanger ces deux lignes.
-static const uint8_t PIN_ROUGE = D2;
-static const uint8_t PIN_VERT  = D1;
+static const uint8_t PIN_ROUGE = D1;
+static const uint8_t PIN_VERT  = D2;
 
 // Durées (millisecondes).
 static const unsigned long DUREE_FIXE       = 30000;  // vert/rouge fixe : 30 s

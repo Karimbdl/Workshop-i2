@@ -206,8 +206,8 @@ LED bicolore à cathode commune, deux résistances de 220 Ω.
 
 | Broche ESP8266 | via | Patte de la LED |
 |---|---|---|
-| D1 | résistance 220 Ω | verte |
-| D2 | résistance 220 Ω | rouge |
+| D1 | résistance 220 Ω | rouge |
+| D2 | résistance 220 Ω | verte |
 | G | fil direct | commune (la plus longue) |
 
 Si les couleurs sont inversées au démarrage, échanger `PIN_ROUGE` et `PIN_VERT` dans
