@@ -1,0 +1,22 @@
+# Déploiement complet de RESILIENCE-ALPHA, de zéro ou en mise à jour (idempotent) :
+#   prérequis -> secrets -> docker compose up -> descellement Vault -> vérification -> audit
+#
+#   scripts/ra.ps1 deploy                 (Windows)
+#   scripts/ra.sh deploy                  (Linux / macOS)
+#   ... deploy -e ra_build=always         reconstruit les images après une modification du code
+- name: Déploiement de la plateforme RESILIENCE-ALPHA
+  hosts: hote
+  gather_facts: false
+  roles:
+    - role: prerequis
+      tags: [prerequis]
+    - role: secrets
+      tags: [secrets]
+    - role: deploiement
+      tags: [deploiement]
+    - role: vault
+      tags: [vault]
+    - role: verification
+      tags: [verification]
+    - role: audit
+      tags: [audit]

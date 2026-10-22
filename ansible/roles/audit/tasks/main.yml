@@ -1,0 +1,61 @@
+# Audit de durcissement : contrôle sur les conteneurs réellement lancés (pas sur
+# le fichier) que les règles de sécurité du projet sont respectées. Le rôle liste
+# tous les écarts puis échoue s'il y en a, pour avoir un rapport complet.
+
+- name: Lecture de la configuration des conteneurs
+  community.docker.docker_container_info:
+    name: "{{ ra_project }}-{{ item }}-1"
+  loop: "{{ ra_services }}"
+  register: ra_info
+
+- name: Analyse des conteneurs
+  ansible.builtin.set_fact:
+    ra_ecarts: "{{ ra_ecarts | default([]) + ecarts }}"
+    ra_root_users: "{{ ra_root_users | default([]) + ([svc] if (c.Config.User | default('')) in ['', 'root', '0'] else []) }}"
+  loop: "{{ ra_info.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    svc: "{{ item.item }}"
+    c: "{{ item.container }}"
+    publies: >-
+      {%- set out = [] -%}
+      {%- for p, binds in (c.HostConfig.PortBindings | default({}, true)).items() -%}
+      {%- for b in binds -%}{%- set _ = out.append((b.HostIp or '0.0.0.0') ~ ':' ~ b.HostPort) -%}{%- endfor -%}
+      {%- endfor -%}{{ out }}
+    sockets: "{{ c.Mounts | selectattr('Source', 'search', 'docker.sock') | list | length > 0 }}"
+    ecarts: >-
+      {%- set e = [] -%}
+      {%- if not item.exists -%}{%- set _ = e.append(svc ~ ' : conteneur absent') -%}{%- else -%}
+      {%- if c.HostConfig.Privileged -%}{%- set _ = e.append(svc ~ ' : mode privilégié') -%}{%- endif -%}
+      {%- if 'no-new-privileges:true' not in (c.HostConfig.SecurityOpt | default([], true)) -%}{%- set _ = e.append(svc ~ ' : no-new-privileges absent') -%}{%- endif -%}
+      {%- if sockets and not svc.startswith('docker-proxy') -%}{%- set _ = e.append(svc ~ ' : socket Docker monté directement') -%}{%- endif -%}
+      {%- for p in publies -%}{%- if p not in ra_ports_autorises.get(svc, []) -%}{%- set _ = e.append(svc ~ ' : port publié non autorisé ' ~ p) -%}{%- endif -%}{%- endfor -%}
+      {%- endif -%}{{ e }}
+
+- name: Aucun secret ni donnée biométrique suivi par git
+  ansible.builtin.command:
+    cmd: git ls-files secrets .env backups services/face-agent/faces.json services/face-agent/models
+    chdir: "{{ ra_root }}"
+  register: ra_git_secrets
+  changed_when: false
+  failed_when: false
+
+- name: Ajout des fichiers sensibles versionnés aux écarts
+  ansible.builtin.set_fact:
+    ra_ecarts: "{{ ra_ecarts + (ra_git_secrets.stdout_lines | map('regex_replace', '^', 'git : fichier sensible versionné ') | list) }}"
+  when: ra_git_secrets.rc == 0
+
+- name: Rapport d'audit
+  ansible.builtin.debug:
+    msg:
+      - "Conteneurs contrôlés : {{ ra_services | length }}"
+      - "Ports publiés autorisés : {{ ra_ports_autorises }}"
+      - "Conteneurs en root (justifiés par l'image : proxys Docker, Postgres, Vault, Mosquitto) : {{ ra_root_users | join(', ') }}"
+      - "Écarts : {{ ra_ecarts | length }}"
+
+- name: Aucun écart de durcissement
+  ansible.builtin.assert:
+    that: ra_ecarts | length == 0
+    fail_msg: "{{ ra_ecarts }}"
+    success_msg: "Durcissement conforme : privilèges, socket Docker, ports publiés, secrets hors dépôt."

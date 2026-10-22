@@ -260,6 +260,7 @@ Si les couleurs sont inversées au démarrage, échanger `PIN_ROUGE` et `PIN_VER
 ### Prérequis
 
 - **Docker Desktop** avec WSL2 (testé sous Windows 11). 8 Go de RAM alloués suffisent.
+  C'est tout ce qu'il faut pour déployer : Ansible tourne dans un conteneur.
 - **Python 3.11+** pour les scripts. Les scripts n'utilisent que la bibliothèque standard, sauf
   `init_secrets.py` qui utilise `cryptography` ou, à défaut, `openssl`.
 - **Node.js** seulement pour lancer la console en mode développement.
@@ -284,21 +285,57 @@ Les valeurs par défaut conviennent. Pour changer les ports ou les limites de d�
 cp .env.example .env
 ```
 
-### Étape 3 : lancer la plateforme
+### Étape 3 : déployer avec Ansible
 
+Le déploiement est automatisé par Ansible (dossier `ansible/`). Ansible ne tourne pas sous
+Windows : il est embarqué dans un conteneur « poste de pilotage » qui pilote le Docker du PC
+Hôte. Seul Docker est nécessaire. Le lanceur construit l'image tout seul à la première utilisation.
+
+```powershell
+.\scripts\ra.ps1 deploy          # Windows
+```
 ```bash
-docker compose up -d --build
-docker compose ps
+scripts/ra.sh deploy             # Linux / macOS
 ```
 
-Le premier build prend quelques minutes. Au premier lancement, `vault-bootstrap` initialise et
-remplit Vault tout seul.
+Le playbook `site.yml` enchaîne six rôles, tous idempotents (on peut le relancer sans risque) :
 
-> Après un redémarrage du PC ou de Docker, Vault est de nouveau scellé (c'est le comportement
-> normal d'un vrai Vault). Pour le desceller :
-> `docker compose up -d --force-recreate vault-bootstrap`
+| Rôle | Ce qu'il fait |
+|---|---|
+| `prerequis` | vérifie le moteur Docker, Compose, la mémoire allouée, la présence du dépôt |
+| `secrets` | génère les secrets manquants, sans jamais les afficher |
+| `deploiement` | `docker compose up` (construit les images si besoin), attend que les 23 services soient en marche et sains |
+| `vault` | relance l'amorçage, vérifie que Vault est initialisé et descellé |
+| `verification` | passerelle, site client, console, routes internes cachées, WAF, puis le test de bout en bout |
+| `audit` | contrôle les conteneurs lancés : pas de mode privilégié, `no-new-privileges` partout, socket Docker réservé aux proxys, seuls les ports autorisés publiés, aucun secret ni donnée biométrique dans git |
+
+Les autres commandes du lanceur :
+
+```powershell
+.\scripts\ra.ps1 verifier                     # contrôle + audit, sans rien modifier
+.\scripts\ra.ps1 desceller                    # après un redémarrage du PC ou de Docker
+.\scripts\ra.ps1 deploy -e ra_build=always    # reconstruit les images après une modification du code
+.\scripts\ra.ps1 deploy --tags verification   # un seul rôle
+.\scripts\ra.ps1 arreter                      # arrête (données conservées ; -e ra_purger=true pour tout effacer)
+.\scripts\ra.ps1 sauvegarder                  # sauvegarde chiffrée : base, secrets, modèle ML, visages
+.\scripts\ra.ps1 restaurer                    # reconstruction avec les données (PRA), ici ou sur une machine neuve
+.\scripts\ra.ps1 compose ps                   # toute commande docker compose sur le projet
+.\scripts\ra.ps1 compose up -d --build admin-api
+```
+
+La sauvegarde et la reprise après sinistre (PRA) sont détaillées dans `ansible/README.md`.
+
+> **Important** : une fois la plateforme déployée par Ansible, passer par `ra.ps1 compose ...`
+> plutôt que par `docker compose ...` lancé directement sous Windows. Les deux voient les chemins
+> du dépôt différemment (`C:\...` contre `/c/...`), et Compose recréerait alors tous les conteneurs.
+
+Sans Ansible, la plateforme se lance aussi à la main avec `docker compose up -d --build`. Vault
+est alors à desceller avec `docker compose up -d --force-recreate vault-bootstrap` après chaque
+redémarrage.
 
 ### Étape 4 : vérifier
+
+`ra.ps1 deploy` et `ra.ps1 verifier` lancent déjà le test de bout en bout. Pour le lancer seul :
 
 ```bash
 python scripts/smoke_test.py
@@ -457,7 +494,7 @@ dégeler le grand livre, bloquer ou débloquer une IP.
 | Problème | Solution |
 |---|---|
 | Un compte de démo est verrouillé après une force brute | Purger les verrous Redis : `docker exec resilience-alpha-redis-1 redis-cli -a "$(cat secrets/redis_password)" --no-auth-warning --scan --pattern 'fail:*'` puis `DEL` sur chaque clé |
-| Vault scellé après un redémarrage | `docker compose up -d --force-recreate vault-bootstrap` |
+| Vault scellé après un redémarrage | `.\scripts\ra.ps1 desceller` |
 | La vidéo de la webcam est noire | Le service se rétablit tout seul en ~1,5 s. Sinon, redémarrer `face_service`. Vérifier qu'aucune autre application n'utilise la webcam |
 | Visage non reconnu alors qu'il est enrôlé | Regarder la webcam en face (pas l'écran en dessous). Seuil réglable dans `face_lib.py` (`COSINE_THRESHOLD`, 0.363 par défaut) |
 | L'ESP8266 ne se connecte pas au WiFi | Réseau 2,4 GHz obligatoire, pas le point d'accès mobile de Windows 11 |
@@ -481,8 +518,8 @@ dégeler le grand livre, bloquer ou débloquer une IP.
 - **Paiement refusé pendant un gel.** Le client voit `REJECTED`, sans le motif précis.
 - **Vault** : une seule clé de descellement, stockée dans un volume local. Suffisant pour la
   démo, pas pour de la production.
-- **Restent à faire** : automatisation du déploiement (Ansible), assistant RAG (Ollama +
-  LangChain), volet gouvernance (PCA/PRA, NIS2, DORA), analyse EBIOS RM complète.
+- **Restent à faire** : assistant RAG (Ollama + LangChain), volet gouvernance (PCA/PRA, NIS2,
+  DORA), analyse EBIOS RM complète.
 
 ---
 
@@ -492,6 +529,7 @@ dégeler le grand livre, bloquer ou débloquer une IP.
 resilience-alpha/
 ├── docker-compose.yml          orchestration de tous les conteneurs
 ├── .env.example                ports et limites de débit
+├── ansible/                    déploiement automatisé (playbooks, rôles, image du poste de pilotage)
 ├── docs/                       architecture, analyse de risque, playbook d'attaque, consigne 1
 ├── firmware/
 │   └── led-backoffice/         firmware ESP8266 (PlatformIO)
@@ -504,6 +542,7 @@ resilience-alpha/
 │   ├── mosquitto/              broker MQTT
 │   └── vault/                  serveur, agent, script d'amorçage
 ├── scripts/
+│   ├── ra.ps1 / ra.sh          lanceur : Ansible et Compose via le poste de pilotage
 │   ├── init_secrets.py         génération des secrets et des comptes
 │   ├── smoke_test.py           test de bout en bout
 │   ├── build_dashboards.py     génération des tableaux Grafana
@@ -532,6 +571,7 @@ resilience-alpha/
 |---|---|
 | `docs/architecture.md` | Dossier d'architecture : rôle de chaque composant, flux, choix techniques |
 | `docs/architecture.png` | Schéma d'architecture |
+| `ansible/README.md` | Déploiement automatisé : playbooks, rôles, variables, poste de pilotage |
 | `docs/ebios-rm.md` | Analyse de risques EBIOS RM (brouillon) |
 | `docs/playbook-attaque.md` | Scénario d'attaque, règles d'engagement, réponses attendues |
 | `docs/consigne-additionnelle-1.md` | Conception de la reconnaissance faciale et de l'objet connecté |

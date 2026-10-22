@@ -1,0 +1,33 @@
+# Construit les images si besoin et démarre la plateforme avec Docker Compose,
+# puis attend que chaque service soit en marche (et sain s'il a un healthcheck).
+
+- name: Démarrage de la plateforme (docker compose up)
+  community.docker.docker_compose_v2:
+    project_src: "{{ ra_root }}"
+    project_name: "{{ ra_project }}"
+    state: present
+    build: "{{ ra_build }}"
+    pull: missing
+    remove_orphans: false
+  register: ra_up
+
+- name: Attente que tous les services soient en marche
+  ansible.builtin.command: docker compose -p {{ ra_project }} ps --format json
+  args:
+    chdir: "{{ ra_root }}"
+  register: ra_ps
+  changed_when: false
+  vars:
+    ra_etat: "{{ ra_ps.stdout_lines | map('from_json') | list }}"
+    ra_prets: >-
+      {{ ra_etat
+         | selectattr('State', 'equalto', 'running')
+         | rejectattr('Health', 'in', ['starting', 'unhealthy'])
+         | map(attribute='Service') | list }}
+  until: ra_services | difference(ra_prets) | length == 0
+  retries: "{{ (ra_wait_timeout / 5) | int }}"
+  delay: 5
+
+- name: Bilan du déploiement
+  ansible.builtin.debug:
+    msg: "{{ ra_services | length }} services en marche et sains."

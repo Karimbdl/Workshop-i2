@@ -18,3 +18,6 @@ runtime/
 
 # Photos des consignes (référence locale, hors dépôt)
 IMG_*.png
+
+# Sauvegardes PRA (archives chiffrées, à copier hors du PC Hôte)
+backups/

@@ -1,0 +1,9 @@
+# Restauration (PRA) sur cette machine ou sur une machine neuve.
+#   ra.ps1 restaurer                                   (dernière sauvegarde de backups/)
+#   ra.ps1 restaurer -e ra_archive=backups/<fichier>   (sauvegarde précise)
+- name: Restauration de la plateforme RESILIENCE-ALPHA
+  hosts: hote
+  gather_facts: false
+  roles:
+    - prerequis
+    - restauration

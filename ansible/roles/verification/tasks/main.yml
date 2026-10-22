@@ -1,0 +1,41 @@
+# Vérifie la plateforme de l'extérieur, comme un utilisateur : passerelle, sites,
+# puis parcours métier complet (test de bout en bout).
+
+- name: La passerelle répond
+  ansible.builtin.uri:
+    url: "{{ ra_gateway_url }}/healthz"
+    status_code: 200
+  register: ra_health
+  until: ra_health.status == 200
+  retries: 24
+  delay: 5
+
+- name: Le site client et la console sont servis
+  ansible.builtin.uri:
+    url: "{{ ra_gateway_url }}{{ item }}"
+    status_code: 200
+    return_content: false
+  loop: ["/", "/console/"]
+
+- name: Les routes internes ne sont pas exposées
+  ansible.builtin.uri:
+    url: "{{ ra_gateway_url }}/api/internal/integrity"
+    status_code: [403, 404]
+
+- name: Le WAF bloque une injection SQL
+  ansible.builtin.uri:
+    url: "{{ ra_gateway_url }}/api/auth/login?user=admin%27%20OR%201%3D1--"
+    status_code: 403
+
+- name: Test de bout en bout (connexion, consultation, paiement, idempotence, WAF)
+  ansible.builtin.command:
+    cmd: python3 scripts/smoke_test.py --base-url {{ ra_gateway_url }}
+    chdir: "{{ ra_root }}"
+  register: ra_smoke
+  changed_when: false
+
+- name: Résultat du test de bout en bout
+  ansible.builtin.debug:
+    msg:
+      - "{{ ra_smoke.stdout_lines | select('search', 'OK\\]') | list | length }} contrôles réussis"
+      - "{{ ra_smoke.stdout_lines | last }}"

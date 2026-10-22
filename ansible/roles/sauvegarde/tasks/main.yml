@@ -1,0 +1,136 @@
+# Sauvegarde chiffrée de tout ce qu'il faut pour reconstruire la plateforme ailleurs :
+#   - base PostgreSQL (schémas auth, ledger, payment) au format pg_dump personnalisé
+#   - secrets/ (les rôles de la base et les jetons en dépendent)
+#   - modèle ML entraîné (volume ml-model)
+#   - empreintes faciales du back-office (services/face-agent/faces.json), si présentes
+# Vault n'est pas sauvegardé : l'amorçage le recharge entièrement depuis secrets/.
+#
+# L'archive est chiffrée en AES-256 (openssl, PBKDF2) avec la phrase de passe
+# RA_BACKUP_PASSPHRASE. Le dossier de travail en clair est toujours effacé.
+
+- name: Phrase de passe de sauvegarde fournie
+  ansible.builtin.assert:
+    that: lookup('ansible.builtin.env', 'RA_BACKUP_PASSPHRASE') | length >= 12
+    fail_msg: "Définir RA_BACKUP_PASSPHRASE (12 caractères minimum). Le lanceur ra.ps1 la demande."
+    quiet: true
+
+- name: Début de la sauvegarde
+  ansible.builtin.set_fact:
+    ra_debut: "{{ now(utc=false).timestamp() }}"
+    ra_horodatage: "{{ now(utc=false).strftime('%Y%m%d-%H%M%S') }}"
+
+- name: Chemins de travail
+  ansible.builtin.set_fact:
+    ra_staging: "{{ ra_root }}/backups/.travail-{{ ra_horodatage }}"
+    ra_archive_nom: "resilience-alpha-{{ ra_horodatage }}.tar.gz.enc"
+
+- name: Sauvegarde
+  block:
+    - name: Dossier de travail
+      ansible.builtin.file:
+        path: "{{ ra_staging }}"
+        state: directory
+        mode: "0700"
+
+    - name: Empreinte des données avant export
+      ansible.builtin.include_role:
+        name: commun
+        tasks_from: empreinte
+
+    - name: Empreinte avant
+      ansible.builtin.set_fact:
+        ra_empreinte_avant: "{{ ra_empreinte }}"
+
+    - name: Export de la base (pg_dump)
+      ansible.builtin.shell: >-
+        docker exec {{ ra_project }}-postgres-1
+        pg_dump -U postgres -d resilience -Fc -n auth -n ledger -n payment
+        > "{{ ra_staging }}/base.dump"
+      changed_when: true
+
+    - name: Empreinte des données après export
+      ansible.builtin.include_role:
+        name: commun
+        tasks_from: empreinte
+
+    - name: Copie des secrets
+      ansible.builtin.command: cp -a "{{ ra_root }}/secrets" "{{ ra_staging }}/secrets"
+      changed_when: true
+
+    - name: Export du modèle ML
+      ansible.builtin.shell: >-
+        docker run --rm -v {{ ra_project }}_ml-model:/v:ro alpine:3.20
+        tar czf - -C /v . > "{{ ra_staging }}/ml-model.tgz"
+      changed_when: true
+
+    - name: Empreintes faciales présentes ?
+      ansible.builtin.stat:
+        path: "{{ ra_root }}/services/face-agent/faces.json"
+      register: ra_faces
+
+    - name: Copie des empreintes faciales
+      ansible.builtin.copy:
+        src: "{{ ra_root }}/services/face-agent/faces.json"
+        dest: "{{ ra_staging }}/faces.json"
+        mode: "0600"
+      when: ra_faces.stat.exists
+
+    - name: Manifeste de la sauvegarde
+      ansible.builtin.copy:
+        dest: "{{ ra_staging }}/manifeste.json"
+        mode: "0600"
+        content: "{{ manifeste | to_nice_json }}"
+      vars:
+        manifeste:
+          projet: resilience-alpha
+          format: 1
+          date: "{{ ra_horodatage }}"
+          contenu: "{{ ['base.dump', 'secrets/', 'ml-model.tgz'] + (['faces.json'] if ra_faces.stat.exists else []) }}"
+          empreinte: "{{ ra_empreinte }}"
+          # Si des paiements ont eu lieu pendant l'export, l'empreinte n'est pas comparable.
+          coherente: "{{ ra_empreinte_avant == ra_empreinte }}"
+
+    - name: Archive chiffrée (AES-256, PBKDF2)
+      ansible.builtin.shell: |
+        set -eo pipefail
+        tar czf - -C "{{ ra_staging }}" . \
+          | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+              -pass env:RA_BACKUP_PASSPHRASE -out "{{ ra_root }}/backups/{{ ra_archive_nom }}"
+        cd "{{ ra_root }}/backups" && sha256sum "{{ ra_archive_nom }}" > "{{ ra_archive_nom }}.sha256"
+      changed_when: true
+
+  always:
+    - name: Effacement du dossier de travail en clair
+      ansible.builtin.file:
+        path: "{{ ra_staging }}"
+        state: absent
+
+- name: Anciennes sauvegardes
+  ansible.builtin.find:
+    paths: "{{ ra_root }}/backups"
+    patterns: "resilience-alpha-*.tar.gz.enc"
+  register: ra_anciennes
+
+- name: Rotation (on garde les {{ ra_backup_keep }} plus récentes)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ ra_a_supprimer + (ra_a_supprimer | map('regex_replace', '$', '.sha256') | list) }}"
+  vars:
+    ra_a_supprimer: >-
+      {{ (ra_anciennes.files | sort(attribute='mtime', reverse=true))[ra_backup_keep | int:]
+         | map(attribute='path') | list }}
+
+- name: Taille de l'archive
+  ansible.builtin.stat:
+    path: "{{ ra_root }}/backups/{{ ra_archive_nom }}"
+  register: ra_archive_stat
+
+- name: Bilan de la sauvegarde
+  ansible.builtin.debug:
+    msg:
+      - "Archive : backups/{{ ra_archive_nom }} ({{ (ra_archive_stat.stat.size / 1024) | round(1) }} Ko, chiffrée)"
+      - "Durée : {{ (now(utc=false).timestamp() - ra_debut | float) | round(1) }} s"
+      - "Données : {{ ra_empreinte.utilisateurs }} utilisateurs, {{ ra_empreinte.comptes }} comptes, {{ ra_empreinte.virements }} virements, {{ ra_empreinte.paiements }} paiements"
+      - "Grand livre cohérent : {{ (ra_empreinte.comptes_incoherents | int == 0 and ra_empreinte.somme_ecritures_cents | int == 0) | ternary('oui', 'NON') }}"
+      - "À copier hors du PC Hôte (clé USB, stockage distant) : une sauvegarde sur la machine sinistrée ne sert à rien."

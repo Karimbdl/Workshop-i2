@@ -1,0 +1,44 @@
+# Vérifie que la machine peut accueillir la plateforme avant de toucher à quoi que ce soit.
+
+- name: Le dépôt est présent
+  ansible.builtin.stat:
+    path: "{{ ra_root }}/docker-compose.yml"
+  register: ra_compose_file
+
+- name: Arrêt si docker-compose.yml est introuvable
+  ansible.builtin.assert:
+    that: ra_compose_file.stat.exists
+    fail_msg: "docker-compose.yml introuvable dans {{ ra_root }}"
+    quiet: true
+
+- name: Le moteur Docker répond
+  ansible.builtin.command: docker info --format '{{ "{{" }}json .{{ "}}" }}'
+  register: ra_docker_info
+  changed_when: false
+
+- name: Docker Compose v2 est disponible
+  ansible.builtin.command: docker compose version --short
+  register: ra_compose_version
+  changed_when: false
+
+- name: Lecture des caractéristiques du moteur
+  ansible.builtin.set_fact:
+    ra_docker: "{{ ra_docker_info.stdout | from_json }}"
+
+- name: Mémoire allouée à Docker
+  ansible.builtin.set_fact:
+    ra_docker_mem_gb: "{{ (ra_docker.MemTotal | int / 1024 / 1024 / 1024) | round(1) }}"
+
+- name: Avertissement si la mémoire est juste
+  ansible.builtin.debug:
+    msg: >-
+      Attention : {{ ra_docker_mem_gb }} Go alloués à Docker, {{ ra_min_docker_mem_gb }} Go conseillés
+      (la plateforme complète tient dans ~1 Go au repos, mais les builds et le ML consomment davantage).
+  when: ra_docker_mem_gb | float < ra_min_docker_mem_gb
+
+- name: Résumé de l'environnement
+  ansible.builtin.debug:
+    msg:
+      - "Docker {{ ra_docker.ServerVersion }} ({{ ra_docker.OperatingSystem }}), {{ ra_docker.NCPU }} CPU, {{ ra_docker_mem_gb }} Go"
+      - "Docker Compose {{ ra_compose_version.stdout }}"
+      - "Dépôt : {{ ra_root }}"

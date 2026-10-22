@@ -1,0 +1,38 @@
+# Un vrai Vault se rescelle à chaque redémarrage. On relance l'amorçage, qui
+# initialise si besoin, descelle, recharge les secrets et l'AppRole (idempotent),
+# puis on vérifie que Vault est bien descellé.
+
+- name: Relance de l'amorçage de Vault
+  community.docker.docker_compose_v2:
+    project_src: "{{ ra_root }}"
+    project_name: "{{ ra_project }}"
+    services: [vault-bootstrap]
+    dependencies: false
+    recreate: always
+    state: present
+    wait: false
+  changed_when: false
+
+- name: Attente de la fin de l'amorçage
+  ansible.builtin.command: docker wait {{ ra_project }}-vault-bootstrap-1
+  register: ra_bootstrap_rc
+  changed_when: false
+  failed_when: ra_bootstrap_rc.stdout | trim != '0'
+
+- name: État de Vault
+  ansible.builtin.command: docker exec {{ ra_project }}-vault-1 vault status -format=json
+  register: ra_vault_status
+  changed_when: false
+  # vault status renvoie 2 quand Vault est scellé : on veut lire la réponse quand même.
+  failed_when: ra_vault_status.rc not in [0, 2]
+  until: ra_vault_status.rc == 0
+  retries: 10
+  delay: 2
+
+- name: Vault est initialisé et descellé
+  ansible.builtin.assert:
+    that:
+      - (ra_vault_status.stdout | from_json).initialized
+      - not (ra_vault_status.stdout | from_json).sealed
+    fail_msg: "Vault est encore scellé. Voir : docker logs {{ ra_project }}-vault-bootstrap-1"
+    success_msg: "Vault {{ (ra_vault_status.stdout | from_json).version }} descellé."

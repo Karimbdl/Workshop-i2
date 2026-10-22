@@ -1,0 +1,14 @@
+# Arrête la plateforme. Les données (base, métriques, modèle ML, Vault) sont
+# conservées dans les volumes. Pour tout effacer : -e ra_purger=true
+- name: Arrêt de la plateforme RESILIENCE-ALPHA
+  hosts: hote
+  gather_facts: false
+  vars:
+    ra_purger: false
+  tasks:
+    - name: Arrêt et suppression des conteneurs
+      community.docker.docker_compose_v2:
+        project_src: "{{ ra_root }}"
+        project_name: "{{ ra_project }}"
+        state: absent
+        remove_volumes: "{{ ra_purger | bool }}"

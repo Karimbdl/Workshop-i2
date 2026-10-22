@@ -1,0 +1,7 @@
+# Sauvegarde chiffrée pour le PRA : base, secrets, modèle ML, empreintes faciales.
+#   ra.ps1 sauvegarder          (la phrase de passe est demandée)
+- name: Sauvegarde de la plateforme RESILIENCE-ALPHA
+  hosts: hote
+  gather_facts: false
+  roles:
+    - sauvegarde

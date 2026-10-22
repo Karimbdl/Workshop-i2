@@ -1,0 +1,195 @@
+# Restauration (PRA) : reconstruit la plateforme à partir d'une sauvegarde chiffrée,
+# sur la même machine ou sur une machine neuve (Docker + dépôt suffisent).
+#   1. contrôle d'intégrité et déchiffrement de l'archive
+#   2. remise en place des secrets et des empreintes faciales
+#   3. déploiement (les rôles de la base sont créés avec les secrets restaurés)
+#   4. services applicatifs arrêtés, restauration de la base et du modèle ML
+#   5. redémarrage, descellement de Vault, contrôle des données et vérification
+
+- name: Phrase de passe de sauvegarde fournie
+  ansible.builtin.assert:
+    that: lookup('ansible.builtin.env', 'RA_BACKUP_PASSPHRASE') | length > 0
+    fail_msg: "Définir RA_BACKUP_PASSPHRASE (la phrase utilisée à la sauvegarde)."
+    quiet: true
+
+- name: Début de la restauration
+  ansible.builtin.set_fact:
+    ra_debut: "{{ now(utc=false).timestamp() }}"
+
+- name: Recherche de la sauvegarde la plus récente
+  ansible.builtin.find:
+    paths: "{{ ra_root }}/backups"
+    patterns: "resilience-alpha-*.tar.gz.enc"
+  register: ra_dispo
+  when: ra_archive is not defined
+
+- name: Archive à restaurer
+  ansible.builtin.set_fact:
+    ra_archive_chemin: >-
+      {%- if ra_archive is defined -%}
+        {{ ra_archive if ra_archive.startswith('/') else ra_root ~ '/' ~ ra_archive }}
+      {%- elif ra_dispo.files | length > 0 -%}
+        {{ (ra_dispo.files | sort(attribute='mtime') | last).path }}
+      {%- endif -%}
+
+- name: L'archive existe
+  ansible.builtin.stat:
+    path: "{{ ra_archive_chemin }}"
+  register: ra_archive_stat
+
+- name: Arrêt si aucune archive
+  ansible.builtin.assert:
+    that: ra_archive_chemin | length > 0 and ra_archive_stat.stat.exists
+    fail_msg: "Aucune archive trouvée. Préciser -e ra_archive=backups/<fichier>.tar.gz.enc"
+    quiet: true
+
+- name: Contrôle d'intégrité (SHA-256)
+  ansible.builtin.shell: cd "$(dirname '{{ ra_archive_chemin }}')" && sha256sum -c "$(basename '{{ ra_archive_chemin }}').sha256"
+  changed_when: false
+  register: ra_sha
+  failed_when: ra_sha.rc != 0 and 'No such file' not in ra_sha.stderr
+
+- name: Restauration
+  vars:
+    ra_staging: "{{ ra_root }}/backups/.restauration"
+  block:
+    - name: Dossier de travail vierge
+      ansible.builtin.file:
+        path: "{{ ra_staging }}"
+        state: "{{ item }}"
+        mode: "0700"
+      loop: [absent, directory]
+
+    - name: Déchiffrement et extraction
+      ansible.builtin.shell: |
+        set -eo pipefail
+        openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -pass env:RA_BACKUP_PASSPHRASE -in "{{ ra_archive_chemin }}" \
+          | tar xzf - -C "{{ ra_staging }}"
+      changed_when: false
+      register: ra_dechiffre
+      failed_when: ra_dechiffre.rc != 0
+
+    - name: Lecture du manifeste
+      ansible.builtin.slurp:
+        src: "{{ ra_staging }}/manifeste.json"
+      register: ra_manifeste_brut
+
+    - name: Manifeste
+      ansible.builtin.set_fact:
+        ra_manifeste: "{{ ra_manifeste_brut.content | b64decode | from_json }}"
+
+    - name: Sauvegarde du {{ ra_manifeste.date }}
+      ansible.builtin.debug:
+        msg: "Contenu : {{ ra_manifeste.contenu | join(', ') }}"
+
+    # --- Secrets -----------------------------------------------------------
+    - name: Secrets déjà présents sur cette machine ?
+      ansible.builtin.find:
+        paths: "{{ ra_root }}/secrets"
+      register: ra_secrets_locaux
+
+    - name: Comparaison avec les secrets sauvegardés
+      ansible.builtin.command: diff -rq "{{ ra_root }}/secrets" "{{ ra_staging }}/secrets"
+      register: ra_diff_secrets
+      changed_when: false
+      failed_when: false
+      when: ra_secrets_locaux.matched > 0
+
+    - name: Refus d'écraser des secrets différents sans confirmation
+      ansible.builtin.assert:
+        that: ra_secrets_locaux.matched == 0 or ra_diff_secrets.rc == 0 or (ra_ecraser | default(false) | bool)
+        fail_msg: >-
+          secrets/ existe déjà et diffère de la sauvegarde. Relancer avec -e ra_ecraser=true pour
+          les remplacer (une base déjà créée avec les anciens secrets doit alors être effacée :
+          ra.ps1 arreter -e ra_purger=true).
+        quiet: true
+
+    - name: Remise en place des secrets
+      ansible.builtin.shell: |
+        set -e
+        mkdir -p "{{ ra_root }}/secrets"
+        cp -a "{{ ra_staging }}/secrets/." "{{ ra_root }}/secrets/"
+      when: ra_secrets_locaux.matched == 0 or ra_diff_secrets.rc | default(0) != 0
+      changed_when: true
+
+    # --- Empreintes faciales ----------------------------------------------
+    - name: Remise en place des empreintes faciales
+      ansible.builtin.copy:
+        src: "{{ ra_staging }}/faces.json"
+        dest: "{{ ra_root }}/services/face-agent/faces.json"
+        mode: "0600"
+        force: "{{ ra_ecraser | default(false) | bool }}"
+      when: "'faces.json' in ra_manifeste.contenu"
+
+    # --- Plateforme ---------------------------------------------------------
+    - name: Déploiement de la plateforme
+      ansible.builtin.include_role:
+        name: deploiement
+
+    - name: Arrêt des services qui écrivent en base ou lisent le modèle
+      community.docker.docker_compose_v2:
+        project_src: "{{ ra_root }}"
+        project_name: "{{ ra_project }}"
+        services: "{{ ra_services_ecrivains }}"
+        dependencies: false
+        state: stopped
+
+    - name: Restauration de la base (pg_restore)
+      ansible.builtin.shell: >-
+        docker exec -i {{ ra_project }}-postgres-1
+        pg_restore -U postgres -d resilience --clean --if-exists --single-transaction --exit-on-error
+        < "{{ ra_staging }}/base.dump"
+      changed_when: true
+
+    - name: Restauration du modèle ML
+      ansible.builtin.shell: >-
+        docker run --rm -i -v {{ ra_project }}_ml-model:/v alpine:3.20
+        sh -c 'find /v -mindepth 1 -delete && tar xzf - -C /v'
+        < "{{ ra_staging }}/ml-model.tgz"
+      changed_when: true
+
+  always:
+    - name: Effacement du dossier de travail en clair
+      ansible.builtin.file:
+        path: "{{ ra_root }}/backups/.restauration"
+        state: absent
+
+- name: Redémarrage des services
+  ansible.builtin.include_role:
+    name: deploiement
+
+- name: Descellement de Vault
+  ansible.builtin.include_role:
+    name: vault
+
+# --- Preuve que les données sont revenues à l'identique ------------------------
+- name: Empreinte des données restaurées
+  ansible.builtin.include_role:
+    name: commun
+    tasks_from: empreinte
+
+- name: Grand livre cohérent après restauration
+  ansible.builtin.assert:
+    that:
+      - ra_empreinte.comptes_incoherents | int == 0
+      - ra_empreinte.somme_ecritures_cents | int == 0
+    fail_msg: "Grand livre incohérent après restauration : {{ ra_empreinte }}"
+    success_msg: "Grand livre cohérent : chaque solde égale la somme de ses écritures."
+
+- name: Données identiques à la sauvegarde
+  ansible.builtin.assert:
+    that: ra_empreinte == ra_manifeste.empreinte
+    fail_msg: "Écart avec la sauvegarde. Attendu {{ ra_manifeste.empreinte }}, obtenu {{ ra_empreinte }}"
+    success_msg: "Données identiques à la sauvegarde ({{ ra_empreinte.virements }} virements, {{ ra_empreinte.paiements }} paiements, condensé des soldes {{ ra_empreinte.condense_soldes[:12] }}…)."
+  when: ra_manifeste.coherente | bool
+
+- name: Vérification de la plateforme
+  ansible.builtin.include_role:
+    name: verification
+
+- name: Bilan de la restauration (RTO mesuré)
+  ansible.builtin.debug:
+    msg:
+      - "Sauvegarde restaurée : {{ ra_archive_chemin | basename }} (du {{ ra_manifeste.date }})"
+      - "Durée totale de reprise : {{ (now(utc=false).timestamp() - ra_debut | float) | round(0) | int }} s"

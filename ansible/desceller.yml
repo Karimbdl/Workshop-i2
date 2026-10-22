@@ -1,0 +1,7 @@
+# À lancer après un redémarrage du PC ou de Docker : Vault se rescelle à chaque
+# démarrage (comportement normal d'un vrai Vault).
+- name: Descellement de Vault
+  hosts: hote
+  gather_facts: false
+  roles:
+    - vault

@@ -1,0 +1,36 @@
+# Empreinte des données métier : nombre de lignes par table + condensé des soldes.
+# Sert à prouver qu'une restauration rend exactement les mêmes données.
+# Résultat dans ra_empreinte (dict).
+
+- name: Calcul de l'empreinte des données métier
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ ra_project }}-postgres-1"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - resilience
+      - -Atc
+      - >-
+        SELECT json_build_object(
+          'utilisateurs', (SELECT count(*) FROM auth.users),
+          'comptes',      (SELECT count(*) FROM ledger.accounts),
+          'virements',    (SELECT count(*) FROM ledger.transfers),
+          'ecritures',    (SELECT count(*) FROM ledger.entries),
+          'paiements',    (SELECT count(*) FROM payment.payments),
+          'total_soldes_cents', (SELECT coalesce(sum(balance_cents), 0) FROM ledger.accounts),
+          'condense_soldes', (SELECT md5(string_agg(iban || ':' || balance_cents, ',' ORDER BY iban)) FROM ledger.accounts),
+          'comptes_incoherents', (SELECT count(*) FROM ledger.accounts a
+                                   WHERE a.balance_cents <> coalesce((SELECT sum(e.amount_cents)
+                                     FROM ledger.entries e WHERE e.account_id = a.id), 0)),
+          'somme_ecritures_cents', (SELECT coalesce(sum(amount_cents), 0) FROM ledger.entries)
+        )
+  register: ra_empreinte_sql
+  changed_when: false
+
+- name: Lecture de l'empreinte
+  ansible.builtin.set_fact:
+    ra_empreinte: "{{ ra_empreinte_sql.stdout | from_json }}"

@@ -1,0 +1,25 @@
+# Contrôle d'une plateforme déjà déployée, sans rien modifier :
+# santé, parcours métier de bout en bout, état de Vault, audit de durcissement.
+- name: Vérification de la plateforme RESILIENCE-ALPHA
+  hosts: hote
+  gather_facts: false
+  tasks:
+    - name: État de Vault
+      ansible.builtin.command: docker exec {{ ra_project }}-vault-1 vault status -format=json
+      register: ra_vault_status
+      changed_when: false
+      failed_when: ra_vault_status.rc not in [0, 2]
+
+    - name: Vault est descellé
+      ansible.builtin.assert:
+        that: not (ra_vault_status.stdout | from_json).sealed
+        fail_msg: "Vault est scellé : lancer « ra desceller »."
+        success_msg: "Vault descellé."
+
+    - name: Vérification fonctionnelle
+      ansible.builtin.include_role:
+        name: verification
+
+    - name: Audit de durcissement
+      ansible.builtin.include_role:
+        name: audit

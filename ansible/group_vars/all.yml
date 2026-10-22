@@ -1,0 +1,80 @@
+# Variables communes à tous les playbooks.
+
+# Racine du dépôt telle que vue par le poste de pilotage (fournie par le lanceur).
+ra_root: "{{ lookup('ansible.builtin.env', 'RA_ROOT') | default(playbook_dir ~ '/..', true) }}"
+
+# Nom du projet Compose : préfixe de tous les conteneurs, réseaux et volumes.
+ra_project: resilience-alpha
+
+# Construction des images : policy = seulement si l'image manque,
+# always = reconstruire (après une modification du code).
+ra_build: policy
+
+# Passerelle vue depuis le poste de pilotage (host.docker.internal = le PC Hôte).
+ra_gateway_url: http://host.docker.internal:8080
+
+# Délai max d'attente de la plateforme après un déploiement (secondes).
+ra_wait_timeout: 240
+
+# Mémoire minimale conseillée pour le moteur Docker (Go).
+ra_min_docker_mem_gb: 6
+
+# Fichiers de secrets attendus dans secrets/ (générés par scripts/init_secrets.py).
+ra_secrets:
+  - postgres_password
+  - db_auth_password
+  - db_ledger_password
+  - db_payment_password
+  - redis_password
+  - internal_token
+  - jwt_private_key
+  - seed_users
+  - db_monitor_password
+  - redis_exporter_auth
+  - grafana_admin_password
+
+# Services qui doivent tourner en permanence (vault-bootstrap est ponctuel).
+ra_services:
+  - gateway
+  - frontend
+  - admin-frontend
+  - auth-service
+  - payment-api
+  - ledger-service
+  - admin-api
+  - postgres
+  - redis
+  - ml-detector
+  - remediation-engine
+  - mqtt
+  - prometheus
+  - loki
+  - alloy
+  - grafana
+  - nginx-exporter
+  - postgres-exporter
+  - redis-exporter
+  - docker-proxy-ro
+  - docker-proxy-rw
+  - vault
+  - vault-agent
+
+# Seuls ports publiés autorisés sur l'hôte (contrôlés par le rôle audit).
+#   service: liste des « adresse:port » autorisés
+ra_ports_autorises:
+  gateway: ["0.0.0.0:8080"]
+  mqtt: ["0.0.0.0:1883"]
+  grafana: ["127.0.0.1:3000"]
+  vault: ["127.0.0.1:8200"]
+
+# --- Sauvegarde / restauration (PRA) ---
+# Nombre de sauvegardes conservées dans backups/ (les plus anciennes sont supprimées).
+ra_backup_keep: 7
+
+# Services arrêtés pendant une restauration (ils écrivent en base ou lisent le modèle ML).
+ra_services_ecrivains:
+  - auth-service
+  - payment-api
+  - ledger-service
+  - remediation-engine
+  - ml-detector
