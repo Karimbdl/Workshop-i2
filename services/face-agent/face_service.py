@@ -135,18 +135,19 @@ def _capture_loop():
 
 
 def _watchdog_loop():
-    """Si la lecture reste bloquée dans le pilote, libère la webcam pour débloquer la boucle."""
+    """Signale à la boucle de capture de rouvrir la webcam si elle ne fournit plus d'image.
+
+    IMPORTANT : on ne touche JAMAIS à la webcam depuis ce fil. Une VideoCapture
+    d'OpenCV n'est pas « thread-safe » : la fermer ici pendant que la boucle lit
+    provoque un plantage natif (segfault). On se contente de lever un drapeau, et
+    c'est la boucle de capture, elle seule, qui ferme et rouvre la webcam.
+    """
     global _force_reset
     while _running:
         time.sleep(1.0)
         if _latest_ts and time.time() - _latest_ts > WATCHDOG_SECONDS and not _force_reset:
-            print("[camera] aucune image depuis plusieurs secondes : réinitialisation", flush=True)
+            print("[camera] aucune image depuis plusieurs secondes : réouverture demandée", flush=True)
             _force_reset = True
-            try:
-                if _cam is not None:
-                    _cam.release()  # débloque un read() suspendu
-            except Exception:
-                pass
 
 
 def camera_age():
