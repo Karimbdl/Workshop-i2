@@ -58,6 +58,16 @@ export default function Assistant({ session, onUnauthorized }) {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState(null);
   const bottom = useRef(null);
+  const zone = useRef(null);
+
+  // La zone de saisie grandit avec le texte (jusqu'à ~10 lignes, puis défilement).
+  useEffect(() => {
+    const el = zone.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 260)}px`;
+    el.style.overflowY = el.scrollHeight > 260 ? "auto" : "hidden";
+  }, [question]);
 
   useEffect(() => {
     api.assistant.status(session.token).then((r) => setStatus(r.data)).catch(() => setStatus({ ready: false }));
@@ -160,20 +170,31 @@ export default function Assistant({ session, onUnauthorized }) {
       </div>
 
       <form
-        className="mt-4 flex gap-2"
+        className="mt-4 space-y-2"
         onSubmit={(e) => { e.preventDefault(); ask(); }}
       >
-        <input
-          className="field flex-1"
+        <textarea
+          ref={zone}
+          rows={3}
+          className="field min-h-[6rem] resize-none text-sm leading-relaxed"
           placeholder={ready === false ? "Assistant indisponible pour le moment" : "Posez une question (incident, procédure, commande…)"}
           value={question}
           maxLength={800}
           onChange={(e) => setQuestion(e.target.value)}
+          onKeyDown={(e) => {
+            // Entrée envoie, Maj + Entrée va à la ligne.
+            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); }
+          }}
           disabled={busy}
         />
-        <button className="btn-primary" disabled={busy || question.trim().length < 3}>
-          Envoyer
-        </button>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-xs text-slate-500">
+            Entrée pour envoyer · Maj + Entrée pour aller à la ligne · {question.length}/800
+          </span>
+          <button className="btn-primary !w-auto px-6" disabled={busy || question.trim().length < 3}>
+            Envoyer
+          </button>
+        </div>
       </form>
     </section>
   );

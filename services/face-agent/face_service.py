@@ -41,14 +41,21 @@ _mqtt = None
 
 _frame_lock = threading.Lock()
 _latest = None          # dernière image de la webcam (BGR)
+_latest_ts = 0.0        # instant de la dernière image fraîche
 _running = True
+_cam = None             # webcam ouverte (partagée avec le chien de garde)
+_force_reset = False    # demandé par le chien de garde si la webcam ne répond plus
 
-# Chien de garde caméra : au bout de plusieurs images noires d'affilée (webcam
-# happée par un autre programme, câble, veille…), on referme et on rouvre la
-# webcam pour récupérer tout seul. Une image est « noire » si sa luminosité
-# moyenne est quasi nulle.
-BLACK_MEAN = 6.0          # seuil de luminosité moyenne (0 = noir total)
-BLACK_FRAMES_BEFORE_RESET = 25  # ~1,5 s d'images noires avant de rouvrir
+# Chien de garde caméra. La webcam est rouverte automatiquement dans trois cas :
+#   - images noires d'affilée (webcam happée par un autre programme, veille…) ;
+#   - plus aucune image (lecture en échec, ou lecture bloquée dans le pilote) ;
+#   - image figée : la webcam renvoie toujours exactement la même image.
+BLACK_MEAN = 6.0                # seuil de luminosité moyenne (0 = noir total)
+BLACK_FRAMES_BEFORE_RESET = 25  # ~1,5 s d'images noires
+FAILED_READS_BEFORE_RESET = 40  # ~2 s de lectures en échec
+FROZEN_SECONDS = 3.0            # image identique pendant 3 s = figée
+STALE_SECONDS = 3.0             # au-delà, l'image n'est plus utilisée (vidéo, reconnaissance)
+WATCHDOG_SECONDS = 4.0          # lecture bloquée au-delà : on force la réouverture
 
 
 def _load_faces():
@@ -58,57 +65,100 @@ def _load_faces():
     return {}
 
 
-def _reopen(cam):
+def _reopen(cam, raison=""):
     """Referme proprement la webcam et la rouvre."""
+    global _cam
+    print(f"[camera] réouverture de la webcam ({raison})", flush=True)
     try:
         if cam is not None:
             cam.release()
     except Exception:
         pass
-    time.sleep(0.3)
-    return fl.open_camera()
+    time.sleep(0.5)
+    _cam = fl.open_camera()
+    return _cam
+
+
+def _signature(frame):
+    """Empreinte légère d'une image, pour repérer une image figée."""
+    return hash(frame[::32, ::32].tobytes())
 
 
 def _capture_loop():
-    """Lit la webcam en continu et garde la dernière image.
-
-    Surveille aussi les images noires : si la webcam renvoie du noir trop
-    longtemps, on la rouvre automatiquement (récupération sans intervention).
-    """
-    global _latest
+    """Lit la webcam en continu et garde la dernière image fraîche."""
+    global _latest, _latest_ts, _cam, _force_reset
     cam = None
-    black_streak = 0
+    black_streak = failed = 0
+    last_sig, same_since = None, time.time()
     while _running:
         try:
-            if cam is None or not cam.isOpened():
-                cam = fl.open_camera()  # auto : webcam USB
-                black_streak = 0
+            if cam is None or not cam.isOpened() or _force_reset:
+                cam = _reopen(cam, "demandée par le chien de garde") if _force_reset else fl.open_camera()
+                _cam, _force_reset = cam, False
+                black_streak = failed = 0
+                last_sig, same_since = None, time.time()
             ok, frame = cam.read()
             if not ok or frame is None:
+                failed += 1
+                if failed >= FAILED_READS_BEFORE_RESET:
+                    cam = _reopen(cam, "plus d'image")
+                    failed = 0
                 time.sleep(0.05)
                 continue
-            # Détection d'image noire (webcam prise par un autre process, etc.).
+            failed = 0
             if float(frame.mean()) < BLACK_MEAN:
                 black_streak += 1
                 if black_streak >= BLACK_FRAMES_BEFORE_RESET:
-                    cam = _reopen(cam)
+                    cam = _reopen(cam, "images noires")
                     black_streak = 0
-                    continue
-            else:
-                black_streak = 0
-                with _frame_lock:
-                    _latest = frame
-        except Exception:
-            cam = _reopen(cam)
+                continue
             black_streak = 0
-            time.sleep(0.3)
+            sig = _signature(frame)
+            now = time.time()
+            if sig != last_sig:
+                last_sig, same_since = sig, now
+            elif now - same_since > FROZEN_SECONDS:
+                cam = _reopen(cam, "image figée")
+                last_sig, same_since = None, time.time()
+                continue
+            with _frame_lock:
+                _latest, _latest_ts = frame, now
+        except Exception as exc:
+            try:
+                cam = _reopen(cam, f"erreur : {exc}")
+            except Exception:
+                cam = None
+            black_streak = failed = 0
+            time.sleep(1.0)
     if cam is not None:
         cam.release()
 
 
+def _watchdog_loop():
+    """Si la lecture reste bloquée dans le pilote, libère la webcam pour débloquer la boucle."""
+    global _force_reset
+    while _running:
+        time.sleep(1.0)
+        if _latest_ts and time.time() - _latest_ts > WATCHDOG_SECONDS and not _force_reset:
+            print("[camera] aucune image depuis plusieurs secondes : réinitialisation", flush=True)
+            _force_reset = True
+            try:
+                if _cam is not None:
+                    _cam.release()  # débloque un read() suspendu
+            except Exception:
+                pass
+
+
+def camera_age():
+    return None if not _latest_ts else round(time.time() - _latest_ts, 1)
+
+
 def _get_latest():
+    """Dernière image, seulement si elle est fraîche (sinon None : pas de reconnaissance sur une image périmée)."""
     with _frame_lock:
-        return None if _latest is None else _latest.copy()
+        if _latest is None or time.time() - _latest_ts > STALE_SECONDS:
+            return None
+        return _latest.copy()
 
 
 def _annotate(frame):
@@ -148,6 +198,7 @@ def startup():
     except Exception:
         pass
     threading.Thread(target=_capture_loop, daemon=True).start()
+    threading.Thread(target=_watchdog_loop, daemon=True).start()
 
 
 @app.on_event("shutdown")
@@ -158,7 +209,9 @@ def shutdown():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "enrolled": list(_known)}
+    age = camera_age()
+    return {"status": "ok", "enrolled": list(_known),
+            "camera_ok": age is not None and age <= STALE_SECONDS, "camera_age_s": age}
 
 
 def _mjpeg():
