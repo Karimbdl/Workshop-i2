@@ -52,6 +52,9 @@ function Lancer([string[]]$Cmd) {
     "--add-host", "host.docker.internal:host-gateway"
   )
   if (-not [Console]::IsOutputRedirected) { $opts += "-t" }
+  # Docker écrit sa progression sur stderr : sous PowerShell 5.1, avec « Stop », une sortie
+  # redirigée (2>&1) deviendrait une erreur fatale. Le code de retour fait foi.
+  $ErrorActionPreference = "Continue"
   & docker @opts $Image @Cmd
   exit $LASTEXITCODE
 }

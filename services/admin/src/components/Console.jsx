@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, formatTime } from "../api.js";
 import { Alert, Pill, Spinner } from "./ui.jsx";
 import Habilitations from "./Habilitations.jsx";
+import Assistant from "./Assistant.jsx";
 
 const REFRESH_MS = 10_000;
 const GRAVITE_TONE = { "élevée": "rose", "moyenne": "amber", "faible": "slate" };
@@ -119,9 +120,8 @@ export default function Console({ session, onLogout }) {
       </header>
 
       <main className="mx-auto max-w-6xl space-y-6 px-4 py-6">
-        {isAdmin && (
-          <nav className="flex gap-1 rounded-xl bg-slate-900/60 p-1 ring-1 ring-slate-800 sm:w-max">
-            {[["supervision", "Supervision"], ["habilitations", "Habilitations"]].map(([key, label]) => (
+        <nav className="flex gap-1 rounded-xl bg-slate-900/60 p-1 ring-1 ring-slate-800 sm:w-max">
+            {[["supervision", "Supervision"], ["assistant", "Assistant"], ...(isAdmin ? [["habilitations", "Habilitations"]] : [])].map(([key, label]) => (
               <button
                 key={key}
                 onClick={() => setTab(key)}
@@ -132,10 +132,11 @@ export default function Console({ session, onLogout }) {
                 {label}
               </button>
             ))}
-          </nav>
-        )}
+        </nav>
 
-        {tab === "habilitations" && isAdmin ? (
+        {tab === "assistant" ? (
+          <Assistant session={session} onUnauthorized={onLogout} />
+        ) : tab === "habilitations" && isAdmin ? (
           <Habilitations session={session} />
         ) : (
         <>

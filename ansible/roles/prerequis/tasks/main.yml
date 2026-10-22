@@ -42,3 +42,21 @@
       - "Docker {{ ra_docker.ServerVersion }} ({{ ra_docker.OperatingSystem }}), {{ ra_docker.NCPU }} CPU, {{ ra_docker_mem_gb }} Go"
       - "Docker Compose {{ ra_compose_version.stdout }}"
       - "Dépôt : {{ ra_root }}"
+
+- name: Ollama (assistant RAG) joignable sur l'hôte
+  ansible.builtin.uri:
+    url: "{{ ra_ollama_url }}/api/tags"
+    return_content: true
+  register: ra_ollama
+  failed_when: false
+
+- name: Avertissement si Ollama ou ses modèles manquent
+  ansible.builtin.debug:
+    msg: >-
+      Attention : {{ 'Ollama injoignable sur ' ~ ra_ollama_url ~ ' (lancer « ollama serve »)'
+      if ra_ollama.status | default(0) != 200 else
+      'modèles manquants : ' ~ (ra_ollama_modeles | difference(ra_ollama.json.models | map(attribute='name') | list) | join(', '))
+      ~ ' (ollama pull ...)' }}. L'assistant de la console sera indisponible, le reste fonctionne.
+  when: >-
+    ra_ollama.status | default(0) != 200
+    or (ra_ollama_modeles | difference(ra_ollama.json.models | map(attribute='name') | list) | length > 0)

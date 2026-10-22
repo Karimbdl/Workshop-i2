@@ -219,6 +219,7 @@ services:
       PROMETHEUS_URL: http://prometheus:9090
       ML_DETECTOR_URL: http://ml-detector:8000
       REMEDIATION_URL: http://remediation-engine:8000
+      RAG_URL: http://rag-assistant:8000
       # Secrets servis par Vault (Vault Agent), avec repli sur les Docker secrets.
       SECRETS_DIRS: /vault/secrets:/run/secrets
     secrets: [internal_token]
@@ -257,6 +258,38 @@ services:
     deploy:
       resources:
         limits: { cpus: "0.5", memory: 192M, pids: 200 }
+
+  # Assistant SOC (RAG) : LangChain + Ollama (modèles sur le GPU du PC Hôte).
+  # Appelé uniquement par admin-api ; ne détient aucun secret, ne déclenche aucune action.
+  rag-assistant:
+    <<: *hardening
+    build:
+      context: ./services
+      dockerfile: python.Dockerfile
+      args: { SERVICE_DIR: rag-assistant }
+    image: resilience-alpha/rag-assistant:dev
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      RAG_CHAT_MODEL: ${RAG_CHAT_MODEL:-ministral-3:8b-instruct-2512-q4_K_M}
+      RAG_EMBED_MODEL: ${RAG_EMBED_MODEL:-bge-m3}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Base documentaire : les documents du projet, en lecture seule.
+      - ./docs:/corpus/docs:ro
+      - ./README.md:/corpus/README.md:ro
+      - ./ansible/README.md:/corpus/ansible/README.md:ro
+      - ./scripts/attack/README.md:/corpus/scripts/attack/README.md:ro
+      - ./scripts/attack/kali-playbook.md:/corpus/scripts/attack/kali-playbook.md:ro
+      - ./infra/prometheus/alerts.yml:/corpus/infra/prometheus/alerts.yml:ro
+      - ./services/face-agent/README.md:/corpus/services/face-agent/README.md:ro
+      - ./firmware/led-backoffice/README.md:/corpus/firmware/led-backoffice/README.md:ro
+    # app : joignable par admin-api ; llm : sortie vers Ollama sur l'hôte.
+    networks: [app, llm]
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M, pids: 200 }
 
   # Broker MQTT : pilotage de la LED du back-office (ESP8266).
   mqtt:
@@ -545,6 +578,8 @@ networks:
   mgmt: {}
   # Objets connectés : broker MQTT accessible depuis le LAN (ESP) et l'hôte.
   iot: {}
+  # Accès de l'assistant RAG au serveur Ollama du PC Hôte (un réseau interne ne peut pas sortir).
+  llm: {}
 
 volumes:
   pgdata: {}

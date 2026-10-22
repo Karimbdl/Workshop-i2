@@ -46,6 +46,7 @@ ra_services:
   - redis
   - ml-detector
   - remediation-engine
+  - rag-assistant
   - mqtt
   - prometheus
   - loki
@@ -78,3 +79,10 @@ ra_services_ecrivains:
   - ledger-service
   - remediation-engine
   - ml-detector
+
+# --- Assistant RAG ---
+# Ollama tourne sur le PC Hôte (GPU), hors Docker. Son absence n'empêche pas le déploiement.
+ra_ollama_url: http://host.docker.internal:11434
+ra_ollama_modeles:
+  - ministral-3:8b-instruct-2512-q4_K_M
+  - bge-m3:latest

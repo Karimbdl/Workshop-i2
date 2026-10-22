@@ -1,0 +1,6 @@
+# Assistant RAG : LangChain + Ollama, index vectoriel en mémoire (numpy).
+langchain-core==1.6.13
+langchain-ollama==1.1.0
+langchain-text-splitters==1.1.3
+ollama==0.6.3
+numpy==2.5.4

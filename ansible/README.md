@@ -43,9 +43,9 @@ Toute option Ansible passe après la commande : `--check --diff`, `--tags audit`
 
 ```
 site.yml
- ├── prerequis      moteur Docker joignable, Compose v2, mémoire, dépôt présent
+ ├── prerequis      moteur Docker joignable, Compose v2, mémoire, dépôt présent, Ollama
  ├── secrets        secrets/ complet, sinon génération par init_secrets.py (no_log)
- ├── deploiement    docker compose up + attente des 23 services (running et healthy)
+ ├── deploiement    docker compose up + attente des 24 services (running et healthy)
  ├── vault          amorçage, puis contrôle « initialisé et descellé »
  ├── verification   /healthz, /, /console/, routes internes cachées, WAF, smoke_test.py
  └── audit          contrôle de durcissement sur les conteneurs réellement lancés
@@ -76,7 +76,8 @@ Dans `group_vars/all.yml` :
 | `ra_gateway_url` | `http://host.docker.internal:8080` | passerelle vue depuis le poste de pilotage |
 | `ra_wait_timeout` | `240` | attente max des services (s) |
 | `ra_min_docker_mem_gb` | `6` | seuil d'avertissement mémoire |
-| `ra_services` | 23 services | services qui doivent tourner |
+| `ra_services` | 24 services | services qui doivent tourner |
+| `ra_ollama_url`, `ra_ollama_modeles` | voir fichier | Ollama et modèles attendus pour l'assistant (avertissement seulement) |
 | `ra_ports_autorises` | voir fichier | ports publiés tolérés par l'audit |
 
 ## Sauvegarde et reprise après sinistre (PRA)

@@ -80,6 +80,9 @@ témoin est passé.
                                                                     ▼
    Vault ──▶ Vault Agent ──▶ secrets rendus pour admin-api et remediation-engine
 
+   Console (onglet Assistant) ──▶ admin-api ──▶ rag-assistant (LangChain) ──▶ Ollama (GPU du PC Hôte)
+                                  + incident en cours, services, remédiations   + documentation du projet
+
    ─── Hors Docker, sur le PC Hôte ────────────────────────────────────────────────
    Webcam USB ──▶ face-agent (OpenCV, :8070) ──MQTT──▶ Mosquitto (:1883) ──WiFi──▶ ESP8266 + LED
 ```
@@ -102,6 +105,7 @@ sortie vers Internet, aucun port publié).
 | `vault` | oui | serveur Vault, amorçage, agent |
 | `mgmt` | non | Grafana et Vault, publiés sur `127.0.0.1` uniquement |
 | `iot` | non | broker MQTT (doit être joignable par l'ESP8266 sur le LAN) |
+| `llm` | non | assistant RAG, pour joindre Ollama sur le PC Hôte |
 
 Depuis le réseau local, on ne voit que **8080** (passerelle) et **1883** (MQTT). Grafana et Vault
 ne sont accessibles que depuis le PC Hôte lui-même.
@@ -110,7 +114,7 @@ ne sont accessibles que depuis le PC Hôte lui-même.
 
 ## 3. Les composants
 
-Environ 23 conteneurs, plus le service de reconnaissance faciale et la carte ESP8266.
+24 conteneurs, plus deux services sur le PC Hôte (reconnaissance faciale, Ollama) et la carte ESP8266.
 
 ### Applications
 
@@ -151,6 +155,20 @@ Playbooks par type d'incident :
 | `loki` + `alloy` | Collecte des journaux Docker (via un proxy en lecture seule). Alloy fabrique aussi des compteurs à partir des journaux de la passerelle |
 | `nginx-exporter`, `postgres-exporter`, `redis-exporter` | Métriques de l'infrastructure |
 | `grafana` | Deux tableaux de bord : « Vue d'ensemble » et « Vue SOC » (avec une section détection ML). Générés par `scripts/build_dashboards.py` |
+
+### Assistant SOC (IA / RAG)
+
+| Composant | Rôle |
+|---|---|
+| `rag-assistant` | FastAPI + **LangChain**. Indexe la documentation du projet (procédures d'exploitation, architecture, EBIOS RM, playbooks d'attaque, règles d'alerte, PRA) avec le modèle d'embeddings multilingue **bge-m3**, dans un index vectoriel en mémoire. Pour chaque question, retrouve les 5 extraits les plus proches et fait rédiger la réponse par **Ministral 3 8B**, en citant ses sources |
+| Ollama (PC Hôte, hors Docker) | Sert les deux modèles sur la carte graphique (RTX 4060, 8 Go) : rien ne sort de la machine |
+
+L'assistant est relié au reste de la plateforme : `admin-api` vérifie le rôle de l'opérateur,
+puis lui transmet l'**état en direct** (incident du détecteur ML, services hors ligne, dernières
+remédiations). Un opérateur peut donc demander « Que se passe-t-il et que dois-je faire ? » et
+obtenir une réponse fondée sur l'incident réel et sur nos procédures. L'assistant ne détient
+aucun secret et ne peut déclencher aucune action. Testé sur une vraie attaque : incident
+`intrusion_applicative` résumé correctement, bonne fiche de procédure citée, réponse en ~13 s.
 
 ### Secrets
 
@@ -304,7 +322,7 @@ Le playbook `site.yml` enchaîne six rôles, tous idempotents (on peut le relanc
 |---|---|
 | `prerequis` | vérifie le moteur Docker, Compose, la mémoire allouée, la présence du dépôt |
 | `secrets` | génère les secrets manquants, sans jamais les afficher |
-| `deploiement` | `docker compose up` (construit les images si besoin), attend que les 23 services soient en marche et sains |
+| `deploiement` | `docker compose up` (construit les images si besoin), attend que les 24 services soient en marche et sains |
 | `vault` | relance l'amorçage, vérifie que Vault est initialisé et descellé |
 | `verification` | passerelle, site client, console, routes internes cachées, WAF, puis le test de bout en bout |
 | `audit` | contrôle les conteneurs lancés : pas de mode privilégié, `no-new-privileges` partout, socket Docker réservé aux proxys, seuls les ports autorisés publiés, aucun secret ni donnée biométrique dans git |
@@ -346,7 +364,20 @@ idempotence, solde insuffisant, jeton absent ou invalide, blocage d'une injectio
 routes internes invisibles. Code de sortie 0 si tout passe. Pour viser une autre machine :
 `--base-url http://<ip>:8080`.
 
-### Étape 5 : reconnaissance faciale (PC Hôte)
+### Étape 5 : Ollama pour l'assistant (PC Hôte)
+
+L'assistant de la console utilise Ollama, installé sur le PC Hôte (il profite de la carte
+graphique). Une seule fois :
+
+```bash
+ollama pull ministral-3:8b-instruct-2512-q4_K_M
+ollama pull bge-m3
+```
+
+Puis laisser `ollama serve` tourner (ou l'application Ollama). Sans Ollama, tout fonctionne sauf
+l'onglet Assistant ; `ra.ps1 deploy` le signale.
+
+### Étape 5 bis : reconnaissance faciale (PC Hôte)
 
 Une seule fois :
 
@@ -416,6 +447,7 @@ docker compose down -v     # idem + efface les volumes (base, métriques, modèl
 | Grafana | <http://127.0.0.1:3000> (utilisateur `admin`, mot de passe dans `secrets/grafana_admin_password`) | PC Hôte uniquement |
 | Vault | <http://127.0.0.1:8200> (méthode Token, jeton racine ci-dessous) | PC Hôte uniquement |
 | Service visage | <http://127.0.0.1:8070> | PC Hôte uniquement |
+| Ollama | <http://127.0.0.1:11434> | PC Hôte uniquement |
 | Broker MQTT | `<ip du PC Hôte>:1883` | LAN |
 
 Jeton racine de Vault :
@@ -518,8 +550,11 @@ dégeler le grand livre, bloquer ou débloquer une IP.
 - **Paiement refusé pendant un gel.** Le client voit `REJECTED`, sans le motif précis.
 - **Vault** : une seule clé de descellement, stockée dans un volume local. Suffisant pour la
   démo, pas pour de la production.
-- **Restent à faire** : assistant RAG (Ollama + LangChain), volet gouvernance (PCA/PRA, NIS2,
-  DORA), analyse EBIOS RM complète.
+- **Assistant RAG** : il peut se tromper ; il cite ses sources pour que l'opérateur vérifie, et
+  ne déclenche jamais d'action lui-même. Avec 8 Go de mémoire graphique, une petite partie du
+  modèle déborde sur le processeur : une réponse prend 5 à 25 s.
+- **Gouvernance** : le PCA/PRA et l'analyse NIS2/DORA sont rendus dans le dossier PDF.
+  `docs/ebios-rm.md` est un brouillon ; l'analyse EBIOS RM complète est dans le dossier.
 
 ---
 
@@ -575,6 +610,7 @@ resilience-alpha/
 | `docs/ebios-rm.md` | Analyse de risques EBIOS RM (brouillon) |
 | `docs/playbook-attaque.md` | Scénario d'attaque, règles d'engagement, réponses attendues |
 | `docs/consigne-additionnelle-1.md` | Conception de la reconnaissance faciale et de l'objet connecté |
+| `docs/procedures-exploitation.md` | Fiches réflexes de l'opérateur par type d'incident (aussi utilisées par l'assistant) |
 | `scripts/attack/kali-playbook.md` | Commandes Kali, chacune reliée au signal défensif attendu |
 | `services/face-agent/README.md` | Installation et usage de la reconnaissance faciale |
 | `firmware/led-backoffice/README.md` | Câblage, téléversement et test de l'ESP8266 |

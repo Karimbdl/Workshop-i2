@@ -266,3 +266,77 @@ def action_unblock_ip(body: IpIn, principal: Principal = Depends(staff_only)):
 def action_freeze_ledger(body: FreezeIn, principal: Principal = Depends(staff_only)):
     log_event(logger, "action_freeze_ledger", by=principal.username, freeze=body.freeze)
     return engine_call("POST", "/internal/freeze-ledger", {"freeze": body.freeze, "reason": body.reason})
+
+
+# ----------------------------------------------------------------- Assistant
+# L'assistant RAG répond à partir de la documentation du projet. admin-api contrôle
+# le rôle et lui transmet l'état en direct (incident, services, remédiations) : le
+# RAG n'a ainsi besoin d'aucun secret ni d'aucun accès aux autres services.
+
+RAG_URL = os.getenv("RAG_URL", "http://rag-assistant:8000")
+RAG_TIMEOUT = float(os.getenv("RAG_TIMEOUT_SECONDS", "90"))
+
+
+class QuestionIn(BaseModel):
+    question: str = Field(min_length=3, max_length=800)
+
+
+def live_context() -> dict:
+    """État en direct transmis à l'assistant. Chaque source est facultative."""
+    ctx: dict = {"date": _iso()}
+    try:
+        st = detector_status()
+        ctx["detecteur"] = {"etat": st.get("state"), "score_anomalie": st.get("anomaly_score")}
+        ctx["incident"] = incident_view(st.get("incident"))
+    except Exception:
+        ctx["detecteur"] = "indisponible"
+    try:
+        down = [s["label"] for s in services_state() if not s["up"]]
+        ctx["services_hors_ligne"] = down
+    except Exception:
+        ctx["services_hors_ligne"] = "inconnu (Prometheus indisponible)"
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            resp = client.get(f"{REMEDIATION_URL}/internal/remediations",
+                              headers={"X-Internal-Token": INTERNAL_TOKEN or ""})
+            resp.raise_for_status()
+            rems = resp.json().get("remediations", [])[:3]
+        ctx["remediations_recentes"] = [
+            {k: r.get(k) for k in ("at", "incident", "label", "action", "resultat", "verified") if k in r}
+            for r in rems
+        ]
+    except Exception:
+        ctx["remediations_recentes"] = "inconnu (moteur injoignable)"
+    return ctx
+
+
+@app.get("/admin/assistant/status")
+def assistant_status(principal: Principal = Depends(staff_only)):
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            resp = client.get(f"{RAG_URL}/status")
+            resp.raise_for_status()
+            return resp.json()
+    except Exception:
+        return {"ready": False, "error": "Assistant injoignable"}
+
+
+@app.post("/admin/assistant")
+def assistant_ask(body: QuestionIn, principal: Principal = Depends(staff_only)):
+    """Pose une question à l'assistant, avec l'état en direct de la plateforme."""
+    ctx = live_context()
+    log_event(logger, "assistant_question", by=principal.username,
+              incident=(ctx.get("incident") or {}).get("type") if isinstance(ctx.get("incident"), dict) else None)
+    try:
+        with httpx.Client(timeout=RAG_TIMEOUT) as client:
+            resp = client.post(f"{RAG_URL}/ask", json={"question": body.question, "contexte": ctx})
+    except Exception as exc:
+        log_event(logger, "assistant_unavailable", logging.WARNING, error=str(exc))
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Assistant injoignable")
+    if resp.status_code != 200:
+        detail = resp.json().get("detail", "Erreur de l'assistant") if resp.headers.get(
+            "content-type", "").startswith("application/json") else "Erreur de l'assistant"
+        raise HTTPException(resp.status_code, detail)
+    data = resp.json()
+    data["contexte"] = ctx
+    return data

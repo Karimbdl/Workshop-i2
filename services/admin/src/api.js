@@ -87,6 +87,12 @@ export const api = {
       request("/admin/actions/freeze-ledger", { token, method: "POST", body: { freeze, reason } }),
   },
 
+  // --- Assistant SOC (admin-api -> rag-assistant). ---
+  assistant: {
+    status: (token) => request("/admin/assistant/status", { token }),
+    ask: (token, question) => request("/admin/assistant", { token, method: "POST", body: { question } }),
+  },
+
   // --- Habilitations (auth-service, réservé aux administrateurs). ---
   users: {
     list: (token) => request("/auth/users", { token }),

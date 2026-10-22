@@ -23,6 +23,8 @@ geo $remote_addr $is_banned {
 
 limit_req_zone $binary_remote_addr zone=api_per_ip:10m rate=${API_RATE_LIMIT};
 limit_req_zone $binary_remote_addr zone=login_per_ip:10m rate=${LOGIN_RATE_LIMIT};
+# Assistant RAG : chaque question mobilise le modèle de langage (GPU), on limite fort.
+limit_req_zone $binary_remote_addr zone=assistant_per_ip:1m rate=12r/m;
 limit_req_status 429;
 limit_conn_zone $binary_remote_addr zone=conn_per_ip:10m;
 limit_conn_status 429;
@@ -87,6 +89,16 @@ server {
         limit_req zone=api_per_ip burst=${API_RATE_BURST} nodelay;
         rewrite ^/api/(.*)$ /$1 break;
         proxy_pass http://$ledger_upstream;
+    }
+
+    # Assistant RAG de la console : une réponse du modèle prend plusieurs secondes,
+    # d'où un délai de lecture plus long que le reste de l'API.
+    location = /api/admin/assistant {
+        limit_req zone=assistant_per_ip burst=4 nodelay;
+        client_max_body_size 8k;
+        proxy_read_timeout 120s;
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_pass http://$admin_upstream;
     }
 
     # Console d'administration : supervision, réservée aux rôles operator/admin
